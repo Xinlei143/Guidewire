@@ -1,27 +1,32 @@
-"""Stretching-only DER-style dynamic simulation of a 2D soft robot chain.
+"""Stretching + bending DER-style dynamic simulation of a 3D soft robot chain.
 
 The robot is modeled as 10 serial elastic links and 11 point nodes by default.
-The left node is fixed, the right node is free, and only axial stretching is
-implemented. This is not a full DER model because bending and twisting are not
-included yet.
+The left node is fixed, the right node is free, and both axial stretching and
+3D centerline bending are implemented. Twisting is intentionally left for the
+separate 3D stretching + bending + torsion script.
 """
 
 from __future__ import annotations
 
 import argparse
-import os
 from pathlib import Path
-import tempfile
 
 import numpy as np
 
-os.environ.setdefault("MPLCONFIGDIR", tempfile.gettempdir())
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
+from soft_robot_common import (
+    compute_edge_geometry,
+    compute_stretching_forces,
+    compute_vertex_arc_positions,
+    compute_vertex_rest_lengths,
+    external_potential,
+    gravitational_potential,
+    load_matplotlib,
+    stretching_energy,
+)
 
 
 def initialize_chain(num_links: int, total_length: float) -> tuple[np.ndarray, np.ndarray]:
-    """Create a straight horizontal chain and uniform link rest lengths."""
+    """Create a straight 3D chain and uniform link rest lengths."""
     if num_links < 1:
         raise ValueError("num_links must be at least 1.")
     if total_length <= 0:
@@ -30,77 +35,107 @@ def initialize_chain(num_links: int, total_length: float) -> tuple[np.ndarray, n
     num_nodes = num_links + 1
     link_length = total_length / num_links
     x_coordinates = np.linspace(0.0, total_length, num_nodes)
-    positions = np.column_stack((x_coordinates, np.zeros(num_nodes)))
+    positions = np.column_stack(
+        (x_coordinates, np.zeros(num_nodes), np.zeros(num_nodes))
+    )
     rest_lengths = np.full(num_links, link_length)
     return positions, rest_lengths
 
 
-def stretching_energy(
-    positions: np.ndarray, rest_lengths: np.ndarray, stiffness: float
-) -> float:
-    """Return sum of axial spring stretching energies."""
-    # Axial spring stretching energy is computed here for each link.
-    link_vectors = positions[1:] - positions[:-1]
-    current_lengths = np.linalg.norm(link_vectors, axis=1)
-    extensions = current_lengths - rest_lengths
-    return 0.5 * stiffness * float(np.sum(extensions**2))
+def compute_bending_angles(
+    positions: np.ndarray,
+    min_length: float = 1e-12,
+) -> np.ndarray:
+    """Return unsigned bending angles between neighboring 3D edge tangents."""
+    if positions.shape[0] < 3:
+        return np.empty(0)
+
+    _, lengths, tangents = compute_edge_geometry(positions, min_length)
+    dot_products = np.sum(tangents[:-1] * tangents[1:], axis=1)
+    dot_products = np.clip(dot_products, -1.0, 1.0)
+    angles = np.arccos(dot_products)
+
+    valid_vertices = (lengths[:-1] > min_length) & (lengths[1:] > min_length)
+    angles[~valid_vertices] = 0.0
+    return angles
 
 
-def gravitational_potential(
-    positions: np.ndarray, node_masses: np.ndarray, g: float
-) -> float:
-    """Return gravitational potential energy, sum(m_j * g * y_j)."""
-    # Gravity is added here through the vertical coordinate of each node.
-    y_coordinates = positions[:, 1]
-    return float(np.sum(node_masses * g * y_coordinates))
-
-
-def external_potential(positions: np.ndarray, external_forces: np.ndarray) -> float:
-    """Return external-force potential, -sum(F_j dot x_j)."""
-    return -float(np.sum(external_forces * positions))
-
-
-def compute_edge_geometry(
-    positions: np.ndarray, min_length: float = 1e-12
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Compute edge vectors, edge lengths, and unit tangents."""
-    edge_vectors = positions[1:] - positions[:-1]
-    lengths = np.linalg.norm(edge_vectors, axis=1)
-    tangents = np.zeros_like(edge_vectors)
-    valid_edges = lengths > min_length
-    tangents[valid_edges] = edge_vectors[valid_edges] / lengths[valid_edges, None]
-    return edge_vectors, lengths, tangents
-
-
-def compute_stretching_forces(
+def bending_energy(
     positions: np.ndarray,
     rest_lengths: np.ndarray,
     stiffness: float,
-    min_length: float = 1e-12,
+) -> float:
+    """Return 3D centerline bending energy with zero rest curvature."""
+    if stiffness == 0.0 or positions.shape[0] < 3:
+        return 0.0
+
+    angles = compute_bending_angles(positions)
+    vertex_lengths = compute_vertex_rest_lengths(rest_lengths)
+    return 0.5 * stiffness * float(np.sum(angles**2 / vertex_lengths))
+
+
+def compute_bending_forces(
+    positions: np.ndarray,
+    rest_lengths: np.ndarray,
+    stiffness: float,
+    finite_difference_step: float = 1e-6,
 ) -> np.ndarray:
-    """Assemble nodal forces from the negative gradient of stretching energy."""
-    _, current_lengths, tangents = compute_edge_geometry(positions, min_length)
-    extensions = current_lengths - rest_lengths
-    edge_forces = stiffness * extensions[:, None] * tangents
+    """Assemble bending forces as the negative numerical energy gradient."""
+    if stiffness == 0.0 or positions.shape[0] < 3:
+        return np.zeros_like(positions)
+    if finite_difference_step <= 0.0:
+        raise ValueError("finite_difference_step must be positive.")
 
     forces = np.zeros_like(positions)
-    forces[:-1] += edge_forces
-    forces[1:] -= edge_forces
+    for node_index in range(positions.shape[0]):
+        for coordinate_index in range(positions.shape[1]):
+            plus_positions = positions.copy()
+            minus_positions = positions.copy()
+            plus_positions[node_index, coordinate_index] += finite_difference_step
+            minus_positions[node_index, coordinate_index] -= finite_difference_step
+            plus_energy = bending_energy(plus_positions, rest_lengths, stiffness)
+            minus_energy = bending_energy(minus_positions, rest_lengths, stiffness)
+            forces[node_index, coordinate_index] = -(
+                plus_energy - minus_energy
+            ) / (2.0 * finite_difference_step)
+
     return forces
+
+
+def compute_internal_forces(
+    positions: np.ndarray,
+    rest_lengths: np.ndarray,
+    stretch_stiffness: float,
+    bend_stiffness: float,
+) -> np.ndarray:
+    """Return the sum of stretching and bending nodal forces."""
+    stretching_forces = compute_stretching_forces(
+        positions,
+        rest_lengths,
+        stretch_stiffness,
+    )
+    bending_forces = compute_bending_forces(
+        positions,
+        rest_lengths,
+        bend_stiffness,
+    )
+    return stretching_forces + bending_forces
 
 
 def compute_total_energy(
     positions: np.ndarray,
     velocities: np.ndarray,
     rest_lengths: np.ndarray,
-    stiffness: float,
+    stretch_stiffness: float,
+    bend_stiffness: float,
     node_masses: np.ndarray,
     g: float,
     external_forces: np.ndarray,
     free_indices: np.ndarray,
 ) -> dict[str, float]:
-    """Compute stretching, potential, kinetic, and total energy values."""
-    stretch = stretching_energy(positions, rest_lengths, stiffness)
+    """Compute stretching, bending, potential, kinetic, and total energy values."""
+    stretch = stretching_energy(positions, rest_lengths, stretch_stiffness)
+    bend = bending_energy(positions, rest_lengths, bend_stiffness)
     gravity = gravitational_potential(positions, node_masses, g)
     external = external_potential(positions, external_forces)
     kinetic = 0.5 * float(
@@ -108,19 +143,20 @@ def compute_total_energy(
     )
     return {
         "stretching_energy": stretch,
+        "bending_energy": bend,
         "gravitational_energy": gravity,
         "external_energy": external,
         "kinetic_energy": kinetic,
-        "total_energy": stretch + gravity + external + kinetic,
+        "total_energy": stretch + bend + gravity + external + kinetic,
     }
 
 
 def compute_gravity_forces(
     node_masses: np.ndarray, g: float, fixed_indices: np.ndarray
 ) -> np.ndarray:
-    """Return nodal gravity forces in the negative y direction."""
-    gravity_forces = np.zeros((node_masses.size, 2), dtype=float)
-    gravity_forces[:, 1] = -node_masses * g
+    """Return 3D nodal gravity forces in the negative z direction."""
+    gravity_forces = np.zeros((node_masses.size, 3), dtype=float)
+    gravity_forces[:, 2] = -node_masses * g
     gravity_forces[fixed_indices] = 0.0
     return gravity_forces
 
@@ -128,7 +164,8 @@ def compute_gravity_forces(
 def solve_dynamic_explicit(
     initial_positions: np.ndarray,
     rest_lengths: np.ndarray,
-    stiffness: float,
+    stretch_stiffness: float,
+    bend_stiffness: float,
     node_masses: np.ndarray,
     g: float,
     external_forces: np.ndarray,
@@ -139,11 +176,11 @@ def solve_dynamic_explicit(
     save_every: int,
     fixed_indices: tuple[int, ...] = (0,),
 ) -> tuple[np.ndarray, dict[str, np.ndarray | bool | int | None]]:
-    """Run a stretching-only DER-style explicit/semi-implicit time integration.
+    """Run a 3D stretching + bending explicit/semi-implicit time integration.
 
-    The current geometry is updated each step, stretching forces are assembled
-    analytically, damping is used only for time integration, and convergence is
-    checked with the undamped mechanical residual on free nodes.
+    Stretching forces are assembled analytically. Bending forces are assembled
+    from a central finite-difference energy gradient, which keeps this research
+    script easy to check against the bending energy formula.
     """
     if dt <= 0.0:
         raise ValueError("dt must be positive.")
@@ -177,12 +214,15 @@ def solve_dynamic_explicit(
         "time": [],
         "total_energy": [],
         "stretching_energy": [],
+        "bending_energy": [],
         "gravitational_energy": [],
         "external_energy": [],
         "kinetic_energy": [],
+        "bending_angles": [],
         "max_displacement": [],
         "max_velocity_norm": [],
         "max_force_norm": [],
+        "max_abs_bending_angle": [],
         "converged": False,
         "converged_step": None,
         "unstable": False,
@@ -200,11 +240,17 @@ def solve_dynamic_explicit(
         max_displacement = float(
             np.max(np.linalg.norm(positions - initial_positions, axis=1))
         )
+        bending_angles = compute_bending_angles(positions)
+        if bending_angles.size:
+            max_abs_bending_angle = float(np.max(np.abs(bending_angles)))
+        else:
+            max_abs_bending_angle = 0.0
         energies = compute_total_energy(
             positions,
             velocities,
             rest_lengths,
-            stiffness,
+            stretch_stiffness,
+            bend_stiffness,
             node_masses,
             g,
             external_forces,
@@ -216,36 +262,53 @@ def solve_dynamic_explicit(
         history["time"].append(step * dt)
         history["total_energy"].append(energies["total_energy"])
         history["stretching_energy"].append(energies["stretching_energy"])
+        history["bending_energy"].append(energies["bending_energy"])
         history["gravitational_energy"].append(energies["gravitational_energy"])
         history["external_energy"].append(energies["external_energy"])
         history["kinetic_energy"].append(energies["kinetic_energy"])
+        history["bending_angles"].append(bending_angles.copy())
         history["max_displacement"].append(max_displacement)
         history["max_velocity_norm"].append(max_velocity_norm)
         history["max_force_norm"].append(max_force_norm)
+        history["max_abs_bending_angle"].append(max_abs_bending_angle)
         last_saved_step = step
 
     def append_unstable_history(step: int) -> None:
         nonlocal last_saved_step
+        num_bending_angles = max(initial_positions.shape[0] - 2, 0)
         history["positions"].append(positions.copy())
         history["velocities"].append(velocities.copy())
         history["time"].append(step * dt)
         history["total_energy"].append(np.nan)
         history["stretching_energy"].append(np.nan)
+        history["bending_energy"].append(np.nan)
         history["gravitational_energy"].append(np.nan)
         history["external_energy"].append(np.nan)
         history["kinetic_energy"].append(np.nan)
+        history["bending_angles"].append(np.full(num_bending_angles, np.nan))
         history["max_displacement"].append(np.nan)
         history["max_velocity_norm"].append(np.nan)
         history["max_force_norm"].append(np.nan)
+        history["max_abs_bending_angle"].append(np.nan)
         last_saved_step = step
 
-    internal_forces = compute_stretching_forces(positions, rest_lengths, stiffness)
+    internal_forces = compute_internal_forces(
+        positions,
+        rest_lengths,
+        stretch_stiffness,
+        bend_stiffness,
+    )
     residual_forces = internal_forces + external_forces + gravity_forces
     append_history(0, residual_forces)
 
     final_step = 0
     for step in range(1, steps + 1):
-        internal_forces = compute_stretching_forces(positions, rest_lengths, stiffness)
+        internal_forces = compute_internal_forces(
+            positions,
+            rest_lengths,
+            stretch_stiffness,
+            bend_stiffness,
+        )
         residual_forces = internal_forces + external_forces + gravity_forces
         damping_forces = -damping * velocities
         total_forces = residual_forces + damping_forces
@@ -268,7 +331,12 @@ def solve_dynamic_explicit(
             print("Simulation became unstable. Try reducing --dt or increasing --damping.")
             break
 
-        internal_forces = compute_stretching_forces(positions, rest_lengths, stiffness)
+        internal_forces = compute_internal_forces(
+            positions,
+            rest_lengths,
+            stretch_stiffness,
+            bend_stiffness,
+        )
         residual_forces = internal_forces + external_forces + gravity_forces
         max_velocity_norm = float(np.max(np.linalg.norm(velocities[free_indices], axis=1)))
         max_force_norm = float(np.max(np.linalg.norm(residual_forces[free_indices], axis=1)))
@@ -282,7 +350,12 @@ def solve_dynamic_explicit(
             break
 
     if not history["unstable"] and last_saved_step != final_step:
-        internal_forces = compute_stretching_forces(positions, rest_lengths, stiffness)
+        internal_forces = compute_internal_forces(
+            positions,
+            rest_lengths,
+            stretch_stiffness,
+            bend_stiffness,
+        )
         residual_forces = internal_forces + external_forces + gravity_forces
         append_history(final_step, residual_forces)
 
@@ -292,86 +365,130 @@ def solve_dynamic_explicit(
         "time",
         "total_energy",
         "stretching_energy",
+        "bending_energy",
         "gravitational_energy",
         "external_energy",
         "kinetic_energy",
+        "bending_angles",
         "max_displacement",
         "max_velocity_norm",
         "max_force_norm",
+        "max_abs_bending_angle",
     ):
         history[key] = np.asarray(history[key])
 
     return positions, history
 
 
+def set_axes_equal_3d(ax) -> None:
+    """Set equal scale on all axes of a Matplotlib 3D plot."""
+    x_limits = ax.get_xlim3d()
+    y_limits = ax.get_ylim3d()
+    z_limits = ax.get_zlim3d()
+    centers = np.array(
+        [
+            0.5 * sum(x_limits),
+            0.5 * sum(y_limits),
+            0.5 * sum(z_limits),
+        ]
+    )
+    radius = 0.5 * max(
+        x_limits[1] - x_limits[0],
+        y_limits[1] - y_limits[0],
+        z_limits[1] - z_limits[0],
+    )
+    radius = max(radius, 1e-6)
+    ax.set_xlim3d(centers[0] - radius, centers[0] + radius)
+    ax.set_ylim3d(centers[1] - radius, centers[1] + radius)
+    ax.set_zlim3d(centers[2] - radius, centers[2] + radius)
+
+
 def visualize_chain(
     initial_positions: np.ndarray,
     deformed_positions: np.ndarray,
+    rest_lengths: np.ndarray,
     external_forces: np.ndarray,
 ) -> None:
-    """Plot undeformed chain, deformed chain, external force, and displacements."""
+    """Plot 3D chain geometry and bending angle profile."""
+    plt, _ = load_matplotlib()
     displacements = deformed_positions - initial_positions
+    vertex_arc_positions = compute_vertex_arc_positions(rest_lengths)
+    bending_angles = compute_bending_angles(deformed_positions)
 
-    fig, ax = plt.subplots(figsize=(9, 5))
-    ax.plot(
+    fig = plt.figure(figsize=(10, 8))
+    gridspec = fig.add_gridspec(2, 1, height_ratios=[2.0, 1.0])
+    ax_chain = fig.add_subplot(gridspec[0], projection="3d")
+    ax_angles = fig.add_subplot(gridspec[1])
+    ax_chain.plot(
         initial_positions[:, 0],
         initial_positions[:, 1],
+        initial_positions[:, 2],
         "o--",
         label="Undeformed chain",
         color="tab:blue",
     )
-    ax.plot(
+    ax_chain.plot(
         deformed_positions[:, 0],
         deformed_positions[:, 1],
+        deformed_positions[:, 2],
         "o-",
         label="Deformed chain",
         color="tab:orange",
     )
 
-    ax.quiver(
+    ax_chain.quiver(
         initial_positions[:, 0],
         initial_positions[:, 1],
+        initial_positions[:, 2],
         displacements[:, 0],
         displacements[:, 1],
-        angles="xy",
-        scale_units="xy",
-        scale=1.0,
+        displacements[:, 2],
         color="tab:green",
-        width=0.004,
         label="Node displacement",
     )
 
     force_nodes = np.where(np.linalg.norm(external_forces, axis=1) > 0.0)[0]
     if force_nodes.size:
         force_scale = 0.1 / max(np.max(np.linalg.norm(external_forces[force_nodes], axis=1)), 1e-12)
-        ax.quiver(
+        ax_chain.quiver(
             deformed_positions[force_nodes, 0],
             deformed_positions[force_nodes, 1],
+            deformed_positions[force_nodes, 2],
             external_forces[force_nodes, 0] * force_scale,
             external_forces[force_nodes, 1] * force_scale,
-            angles="xy",
-            scale_units="xy",
-            scale=1.0,
+            external_forces[force_nodes, 2] * force_scale,
             color="tab:red",
-            width=0.006,
             label="External force",
         )
 
-    ax.scatter(initial_positions[0, 0], initial_positions[0, 1], s=90, c="black", marker="s", label="Fixed node")
-    ax.text(
+    ax_chain.scatter(initial_positions[0, 0], initial_positions[0, 1], initial_positions[0, 2], s=90, c="black", marker="s", label="Fixed node")
+    ax_chain.text2D(
         0.02,
         0.95,
-        "Gravity acts downward on free nodes",
-        transform=ax.transAxes,
+        "Gravity acts in the -z direction on free nodes",
+        transform=ax_chain.transAxes,
         va="top",
         bbox={"facecolor": "white", "alpha": 0.75, "edgecolor": "none"},
     )
-    ax.set_xlabel("x position (m)")
-    ax.set_ylabel("y position (m)")
-    ax.set_title("2D Soft Robot Chain Dynamic Equilibrium")
-    ax.axis("equal")
-    ax.grid(True, alpha=0.35)
-    ax.legend()
+    ax_chain.set_xlabel("x position (m)")
+    ax_chain.set_ylabel("y position (m)")
+    ax_chain.set_zlabel("z position (m)")
+    ax_chain.set_title("3D Soft Robot Chain Dynamic Equilibrium")
+    set_axes_equal_3d(ax_chain)
+    ax_chain.legend()
+
+    ax_angles.axhline(0.0, color="0.45", linewidth=1.0, alpha=0.6)
+    ax_angles.plot(
+        vertex_arc_positions,
+        bending_angles,
+        "o-",
+        color="tab:purple",
+        label="Bending angle",
+    )
+    ax_angles.set_xlabel("arc length at interior node (m)")
+    ax_angles.set_ylabel("bending angle (rad)")
+    ax_angles.grid(True, alpha=0.35)
+    ax_angles.legend()
     plt.tight_layout()
     plt.show()
 
@@ -379,40 +496,50 @@ def visualize_chain(
 def animate_chain_evolution(
     initial_positions: np.ndarray,
     history: dict[str, np.ndarray | bool | int | None],
+    rest_lengths: np.ndarray,
     external_forces: np.ndarray,
     force_node: int,
     animation_output: str | None = None,
     show: bool = False,
 ) -> None:
-    """Animate saved chain states and optionally save the animation as a GIF."""
+    """Animate saved 3D chain states and optionally save the animation as a GIF."""
+    plt, FuncAnimation = load_matplotlib()
     positions_history = history["positions"]
     time_history = history["time"]
+    bending_angles_history = history["bending_angles"]
+    vertex_arc_positions = compute_vertex_arc_positions(rest_lengths)
     all_positions = np.concatenate((positions_history, initial_positions[None, :, :]), axis=0)
-    min_xy = np.min(all_positions.reshape(-1, 2), axis=0)
-    max_xy = np.max(all_positions.reshape(-1, 2), axis=0)
-    span = np.maximum(max_xy - min_xy, 1e-6)
+    min_xyz = np.min(all_positions.reshape(-1, 3), axis=0)
+    max_xyz = np.max(all_positions.reshape(-1, 3), axis=0)
+    span = np.maximum(max_xyz - min_xyz, 1e-6)
     margin = 0.12 * max(float(np.max(span)), 1e-3)
 
-    fig, ax = plt.subplots(figsize=(9, 5))
-    ax.plot(
+    fig = plt.figure(figsize=(10, 8))
+    gridspec = fig.add_gridspec(2, 1, height_ratios=[2.0, 1.0])
+    ax_chain = fig.add_subplot(gridspec[0], projection="3d")
+    ax_angles = fig.add_subplot(gridspec[1])
+    ax_chain.plot(
         initial_positions[:, 0],
         initial_positions[:, 1],
+        initial_positions[:, 2],
         "o--",
         color="tab:blue",
         label="Initial chain",
     )
-    current_line, = ax.plot([], [], "o-", color="tab:orange", label="Current chain")
-    fixed_marker = ax.scatter(
+    current_line, = ax_chain.plot([], [], [], "o-", color="tab:orange", label="Current chain")
+    fixed_marker = ax_chain.scatter(
         initial_positions[0, 0],
         initial_positions[0, 1],
+        initial_positions[0, 2],
         s=90,
         c="black",
         marker="s",
         label="Fixed node",
     )
-    force_marker = ax.scatter(
-        [],
-        [],
+    force_marker = ax_chain.scatter(
+        initial_positions[force_node, 0],
+        initial_positions[force_node, 1],
+        initial_positions[force_node, 2],
         s=100,
         facecolors="none",
         edgecolors="tab:red",
@@ -420,41 +547,59 @@ def animate_chain_evolution(
         label="Force node",
     )
 
-    force_vector = external_forces[force_node]
-    force_norm = np.linalg.norm(force_vector)
-    force_scale = 0.15 * max(float(np.max(span)), 1e-3) / max(force_norm, 1e-12)
-    force_quiver = ax.quiver(
-        [initial_positions[force_node, 0]],
-        [initial_positions[force_node, 1]],
-        [force_vector[0] * force_scale],
-        [force_vector[1] * force_scale],
-        angles="xy",
-        scale_units="xy",
-        scale=1.0,
-        color="tab:red",
-        width=0.006,
-        label="External force",
-    )
+    ax_chain.set_xlim(min_xyz[0] - margin, max_xyz[0] + margin)
+    ax_chain.set_ylim(min_xyz[1] - margin, max_xyz[1] + margin)
+    ax_chain.set_zlim(min_xyz[2] - margin, max_xyz[2] + margin)
+    set_axes_equal_3d(ax_chain)
+    ax_chain.set_xlabel("x position (m)")
+    ax_chain.set_ylabel("y position (m)")
+    ax_chain.set_zlabel("z position (m)")
+    ax_chain.legend(loc="best")
 
-    ax.set_xlim(min_xy[0] - margin, max_xy[0] + margin)
-    ax.set_ylim(min_xy[1] - margin, max_xy[1] + margin)
-    ax.set_aspect("equal", adjustable="box")
-    ax.grid(True, alpha=0.35)
-    ax.set_xlabel("x position (m)")
-    ax.set_ylabel("y position (m)")
-    ax.legend(loc="best")
+    max_abs_bending_angle = float(np.nanmax(np.abs(bending_angles_history))) if bending_angles_history.size else 0.0
+    angle_margin = 0.1 * max(max_abs_bending_angle, 1.0)
+    ax_angles.axhline(0.0, color="0.45", linewidth=1.0, alpha=0.6)
+    bending_angle_line, = ax_angles.plot(
+        [],
+        [],
+        "o-",
+        color="tab:purple",
+        label="Bending angle",
+    )
+    ax_angles.set_xlim(
+        0.0,
+        max(float(np.sum(rest_lengths)), 1e-12),
+    )
+    ax_angles.set_ylim(
+        -max_abs_bending_angle - angle_margin,
+        max_abs_bending_angle + angle_margin,
+    )
+    ax_angles.set_xlabel("arc length at interior node (m)")
+    ax_angles.set_ylabel("bending angle (rad)")
+    ax_angles.grid(True, alpha=0.35)
+    ax_angles.legend(loc="best")
 
     def update(frame_index: int):
         positions = positions_history[frame_index]
+        bending_angles = bending_angles_history[frame_index]
+        if bending_angles.size:
+            max_frame_bending_angle = float(np.nanmax(np.abs(bending_angles)))
+        else:
+            max_frame_bending_angle = 0.0
         current_line.set_data(positions[:, 0], positions[:, 1])
-        force_marker.set_offsets(positions[force_node : force_node + 1])
-        force_quiver.set_offsets(positions[force_node : force_node + 1])
-        force_quiver.set_UVC(
-            [force_vector[0] * force_scale],
-            [force_vector[1] * force_scale],
+        current_line.set_3d_properties(positions[:, 2])
+        force_marker._offsets3d = (
+            positions[force_node : force_node + 1, 0],
+            positions[force_node : force_node + 1, 1],
+            positions[force_node : force_node + 1, 2],
         )
-        ax.set_title(f"Stretching-only DER-style dynamics, t = {time_history[frame_index]:.4f} s")
-        return current_line, fixed_marker, force_marker, force_quiver
+        bending_angle_line.set_data(vertex_arc_positions, bending_angles)
+        ax_chain.set_title(
+            f"3D stretching + bending DER-style dynamics, "
+            f"t = {time_history[frame_index]:.4f} s, "
+            f"max |bend angle| = {max_frame_bending_angle:.4e} rad"
+        )
+        return current_line, fixed_marker, force_marker, bending_angle_line
 
     animation = FuncAnimation(
         fig,
@@ -481,11 +626,13 @@ def animate_chain_evolution(
 
 def plot_time_history(history: dict[str, np.ndarray | bool | int | None]) -> None:
     """Plot energy and convergence-related time histories."""
+    plt, _ = load_matplotlib()
     time = history["time"]
 
-    fig, axes = plt.subplots(3, 1, figsize=(9, 9), sharex=True)
+    fig, axes = plt.subplots(4, 1, figsize=(9, 11), sharex=True)
     axes[0].plot(time, history["total_energy"], label="Total energy")
     axes[0].plot(time, history["stretching_energy"], label="Stretching energy")
+    axes[0].plot(time, history["bending_energy"], label="Bending energy")
     axes[0].plot(time, history["kinetic_energy"], label="Kinetic energy")
     axes[0].set_ylabel("Energy (J)")
     axes[0].grid(True, alpha=0.35)
@@ -495,12 +642,16 @@ def plot_time_history(history: dict[str, np.ndarray | bool | int | None]) -> Non
     axes[1].set_ylabel("Max displacement (m)")
     axes[1].grid(True, alpha=0.35)
 
-    axes[2].plot(time, history["max_velocity_norm"], color="tab:purple", label="Max velocity")
-    axes[2].plot(time, history["max_force_norm"], color="tab:red", label="Max residual force")
-    axes[2].set_xlabel("Time (s)")
-    axes[2].set_ylabel("Convergence metrics")
+    axes[2].plot(time, history["max_abs_bending_angle"], color="tab:purple")
+    axes[2].set_ylabel("Max |bend angle| (rad)")
     axes[2].grid(True, alpha=0.35)
-    axes[2].legend()
+
+    axes[3].plot(time, history["max_velocity_norm"], color="tab:purple", label="Max velocity")
+    axes[3].plot(time, history["max_force_norm"], color="tab:red", label="Max residual force")
+    axes[3].set_xlabel("Time (s)")
+    axes[3].set_ylabel("Convergence metrics")
+    axes[3].grid(True, alpha=0.35)
+    axes[3].legend()
 
     fig.suptitle("Dynamic Simulation History")
     plt.tight_layout()
@@ -522,6 +673,7 @@ def print_displacements(
             f"  Node {node_index:2d}: "
             f"ux = {displacement[0]: .8e} m, "
             f"uy = {displacement[1]: .8e} m, "
+            f"uz = {displacement[2]: .8e} m, "
             f"|u| = {magnitude: .8e} m"
         )
 
@@ -535,16 +687,16 @@ def print_displacements(
 def build_external_forces(
     num_nodes: int,
     force_node: int,
-    force_vector: tuple[float, float],
+    force_vector: tuple[float, float, float],
     fixed_node: int = 0,
 ) -> np.ndarray:
-    """Create the nodal external-force array."""
+    """Create the 3D nodal external-force array."""
     if force_node == fixed_node:
         raise ValueError("External force cannot be applied to the fixed left node.")
     if force_node < 0 or force_node >= num_nodes:
         raise ValueError(f"force_node must be between 0 and {num_nodes - 1}.")
 
-    external_forces = np.zeros((num_nodes, 2), dtype=float)
+    external_forces = np.zeros((num_nodes, 3), dtype=float)
     # The user-configurable additional external force is added here.
     external_forces[force_node] = np.array(force_vector, dtype=float)
     return external_forces
@@ -553,18 +705,30 @@ def build_external_forces(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Stretching-only DER-style explicit dynamics for a 2D soft robot "
-            "chain. Bending and twisting are not implemented."
+            "Stretching + bending DER-style explicit dynamics for a 3D soft "
+            "robot chain. Twisting is not implemented in this stage."
         )
     )
     parser.add_argument("--num-links", type=int, default=10, help="Number of serial links.")
     parser.add_argument("--total-length", type=float, default=1.0, help="Initial total length in meters.")
-    parser.add_argument("--stiffness", type=float, default=1000.0, help="Axial spring stiffness in N/m.")
+    parser.add_argument(
+        "--stretch-stiffness",
+        type=float,
+        default=1000.0,
+        help="Axial stretching stiffness in N/m.",
+    )
+    parser.add_argument(
+        "--bend-stiffness",
+        type=float,
+        default=0.01,
+        help="3D bending stiffness.",
+    )
     parser.add_argument("--node-mass", type=float, default=0.01, help="Mass of each free node in kg.")
     parser.add_argument("--gravity", type=float, default=9.81, help="Gravitational acceleration in m/s^2.")
     parser.add_argument("--force-node", type=int, default=10, help="Node index where the external force is applied.")
     parser.add_argument("--force-x", type=float, default=1.0, help="External force x component in N.")
     parser.add_argument("--force-y", type=float, default=0.0, help="External force y component in N.")
+    parser.add_argument("--force-z", type=float, default=0.0, help="External force z component in N.")
     parser.add_argument("--dt", type=float, default=1e-4, help="Time step size in seconds.")
     parser.add_argument("--steps", type=int, default=20000, help="Maximum number of time steps.")
     parser.add_argument("--damping", type=float, default=2.0, help="Nodal viscous damping coefficient.")
@@ -592,14 +756,15 @@ def main() -> None:
     external_forces = build_external_forces(
         num_nodes,
         args.force_node,
-        (args.force_x, args.force_y),
+        (args.force_x, args.force_y, args.force_z),
         fixed_node=0,
     )
 
     deformed_positions, history = solve_dynamic_explicit(
         initial_positions=initial_positions,
         rest_lengths=rest_lengths,
-        stiffness=args.stiffness,
+        stretch_stiffness=args.stretch_stiffness,
+        bend_stiffness=args.bend_stiffness,
         node_masses=node_masses,
         g=args.gravity,
         external_forces=external_forces,
@@ -621,7 +786,12 @@ def main() -> None:
     print_displacements(initial_positions, deformed_positions, args.force_node)
 
     if not args.no_plot:
-        visualize_chain(initial_positions, deformed_positions, external_forces)
+        visualize_chain(
+            initial_positions,
+            deformed_positions,
+            rest_lengths,
+            external_forces,
+        )
 
     if args.plot_history:
         if args.no_plot:
@@ -636,6 +806,7 @@ def main() -> None:
         animate_chain_evolution(
             initial_positions=initial_positions,
             history=history,
+            rest_lengths=rest_lengths,
             external_forces=external_forces,
             force_node=args.force_node,
             animation_output=args.animation_output,
