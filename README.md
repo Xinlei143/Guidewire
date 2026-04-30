@@ -58,9 +58,17 @@ execution entry points.
   scripts now use a 3D centerline.
 - `--gravity`: gravitational acceleration. Gravity acts in the negative z
   direction.
-- `--no-plot`: run without opening interactive plot windows.
-- `--plot-history`: show energy and convergence histories.
-- `--animate` or `--animation-output path.gif`: show or save the saved states.
+- `--save-every`: save one history/animation frame every N solver steps. The
+  default is `1000`, which gives one saved frame every `0.1 s` when the default
+  `--dt 1e-4` is used.
+- By default, each script opens three interactive visualizations: the dynamic
+  evolution, the final equilibrium geometry, and diagnostic plots.
+- Dynamic evolution plots show the applied external force as a red arrow.
+- `--animation-output path.gif`: additionally save the dynamic evolution as a
+  GIF. The default is to display the animation without saving it.
+- `--no-plot`: run without opening interactive plot windows or saving GIFs.
+- `--animate` and `--plot-history`: compatibility flags; animation and
+  diagnostics are shown by default unless `--no-plot` is used.
 
 ## Implementation Notes
 

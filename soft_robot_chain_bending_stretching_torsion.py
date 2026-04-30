@@ -652,19 +652,12 @@ def visualize_chain_3d(
     twist_angles: np.ndarray,
     external_forces: np.ndarray,
 ) -> None:
-    """Plot 3D chain geometry and bending/torsion angle diagnostics."""
+    """Plot undeformed chain, equilibrium chain, and external force."""
     plt, _ = load_matplotlib()
-    vertex_arc_positions = compute_vertex_arc_positions(rest_lengths)
-    edge_midpoint_arc_positions = compute_edge_midpoint_arc_positions(rest_lengths)
-    bending_angles = compute_bending_angles(deformed_positions)
-    twist_angle_differences = compute_twist_angle_differences(twist_angles)
+    displacements = deformed_positions - initial_positions
 
-    fig = plt.figure(figsize=(12, 9))
-    gridspec = fig.add_gridspec(2, 3, height_ratios=[2.0, 1.0])
-    ax_chain = fig.add_subplot(gridspec[0, :], projection="3d")
-    ax_bending = fig.add_subplot(gridspec[1, 0])
-    ax_twist = fig.add_subplot(gridspec[1, 1])
-    ax_twist_difference = fig.add_subplot(gridspec[1, 2])
+    fig = plt.figure(figsize=(9, 6))
+    ax_chain = fig.add_subplot(111, projection="3d")
 
     ax_chain.plot(
         initial_positions[:, 0],
@@ -681,6 +674,17 @@ def visualize_chain_3d(
         "o-",
         label="Deformed chain",
         color="tab:orange",
+    )
+
+    ax_chain.quiver(
+        initial_positions[:, 0],
+        initial_positions[:, 1],
+        initial_positions[:, 2],
+        displacements[:, 0],
+        displacements[:, 1],
+        displacements[:, 2],
+        color="tab:green",
+        label="Node displacement",
     )
 
     force_nodes = np.where(np.linalg.norm(external_forces, axis=1) > 0.0)[0]
@@ -713,46 +717,16 @@ def visualize_chain_3d(
     ax_chain.set_ylabel("y position (m)")
     ax_chain.set_zlabel("z position (m)")
     ax_chain.set_title("3D Soft Robot Chain Dynamic Equilibrium")
+    ax_chain.text2D(
+        0.02,
+        0.95,
+        "Gravity acts in the -z direction on free nodes",
+        transform=ax_chain.transAxes,
+        va="top",
+        bbox={"facecolor": "white", "alpha": 0.75, "edgecolor": "none"},
+    )
     set_axes_equal_3d(ax_chain)
     ax_chain.legend()
-
-    ax_bending.plot(
-        vertex_arc_positions,
-        bending_angles,
-        "o-",
-        color="tab:purple",
-        label="Bending angle",
-    )
-    ax_bending.set_xlabel("arc length at interior node (m)")
-    ax_bending.set_ylabel("bending angle (rad)")
-    ax_bending.grid(True, alpha=0.35)
-    ax_bending.legend()
-
-    ax_twist.axhline(0.0, color="0.45", linewidth=1.0, alpha=0.6)
-    ax_twist.plot(
-        edge_midpoint_arc_positions,
-        twist_angles,
-        "o-",
-        color="tab:brown",
-        label="Edge twist angle",
-    )
-    ax_twist.set_xlabel("arc length at edge midpoint (m)")
-    ax_twist.set_ylabel("twist angle (rad)")
-    ax_twist.grid(True, alpha=0.35)
-    ax_twist.legend()
-
-    ax_twist_difference.axhline(0.0, color="0.45", linewidth=1.0, alpha=0.6)
-    ax_twist_difference.plot(
-        vertex_arc_positions,
-        twist_angle_differences,
-        "o-",
-        color="tab:red",
-        label="Twist difference",
-    )
-    ax_twist_difference.set_xlabel("arc length at interior node (m)")
-    ax_twist_difference.set_ylabel("twist difference (rad)")
-    ax_twist_difference.grid(True, alpha=0.35)
-    ax_twist_difference.legend()
     plt.tight_layout()
     plt.show()
 
@@ -761,6 +735,8 @@ def animate_chain_evolution_3d(
     initial_positions: np.ndarray,
     history: dict[str, np.ndarray | bool | int | None],
     rest_lengths: np.ndarray,
+    external_forces: np.ndarray,
+    force_node: int,
     animation_output: str | None = None,
     show: bool = False,
 ) -> None:
@@ -807,6 +783,22 @@ def animate_chain_evolution_3d(
         marker="s",
         label="Fixed node",
     )
+    force_vector = external_forces[force_node]
+    force_norm = float(np.linalg.norm(force_vector))
+    force_scale = 0.1 / max(force_norm, 1e-12)
+    scaled_force = force_vector * force_scale
+    force_quiver = None
+    if force_norm > 0.0:
+        force_quiver = ax_chain.quiver(
+            initial_positions[force_node, 0],
+            initial_positions[force_node, 1],
+            initial_positions[force_node, 2],
+            scaled_force[0],
+            scaled_force[1],
+            scaled_force[2],
+            color="tab:red",
+            label="External force",
+        )
 
     ax_chain.set_xlim(min_xyz[0] - margin, max_xyz[0] + margin)
     ax_chain.set_ylim(min_xyz[1] - margin, max_xyz[1] + margin)
@@ -868,6 +860,7 @@ def animate_chain_evolution_3d(
     ax_twist_difference.legend(loc="best")
 
     def update(frame_index: int):
+        nonlocal force_quiver
         positions = positions_history[frame_index]
         bending_angles = bending_angles_history[frame_index]
         twist_angles = twist_angles_history[frame_index]
@@ -882,6 +875,19 @@ def animate_chain_evolution_3d(
         )
         current_line.set_data(positions[:, 0], positions[:, 1])
         current_line.set_3d_properties(positions[:, 2])
+        if force_quiver is not None:
+            force_quiver.remove()
+            force_quiver = None
+        if force_norm > 0.0:
+            force_quiver = ax_chain.quiver(
+                positions[force_node, 0],
+                positions[force_node, 1],
+                positions[force_node, 2],
+                scaled_force[0],
+                scaled_force[1],
+                scaled_force[2],
+                color="tab:red",
+            )
         bending_line.set_data(vertex_arc_positions, bending_angles)
         twist_line.set_data(edge_midpoint_arc_positions, twist_angles)
         twist_difference_line.set_data(
@@ -919,56 +925,120 @@ def animate_chain_evolution_3d(
         plt.close(fig)
 
 
-def plot_time_history(history: dict[str, np.ndarray | bool | int | None]) -> None:
-    """Plot energy and convergence-related time histories."""
+def plot_time_history(
+    history: dict[str, np.ndarray | bool | int | None],
+    rest_lengths: np.ndarray | None = None,
+) -> None:
+    """Plot final angle profiles plus energy and convergence diagnostics."""
     plt, _ = load_matplotlib()
     time = history["time"]
+    final_bending_angles = history["bending_angles"][-1]
+    final_twist_angles = history["twist_angles"][-1]
+    final_twist_differences = history["twist_angle_differences"][-1]
+    if rest_lengths is None:
+        vertex_arc_positions = np.arange(final_bending_angles.size)
+        edge_midpoint_arc_positions = np.arange(final_twist_angles.size)
+        vertex_xlabel = "interior node index"
+        edge_xlabel = "edge index"
+    else:
+        vertex_arc_positions = compute_vertex_arc_positions(rest_lengths)
+        edge_midpoint_arc_positions = compute_edge_midpoint_arc_positions(rest_lengths)
+        vertex_xlabel = "arc length at interior node (m)"
+        edge_xlabel = "arc length at edge midpoint (m)"
 
-    fig, axes = plt.subplots(5, 1, figsize=(9, 13), sharex=True)
-    axes[0].plot(time, history["total_energy"], label="Total energy")
-    axes[0].plot(time, history["stretching_energy"], label="Stretching energy")
-    axes[0].plot(time, history["bending_energy"], label="Bending energy")
-    axes[0].plot(time, history["torsion_energy"], label="Torsion energy")
-    axes[0].plot(time, history["kinetic_energy"], label="Translational kinetic")
-    axes[0].plot(time, history["twist_kinetic_energy"], label="Twist kinetic")
-    axes[0].set_ylabel("Energy (J)")
-    axes[0].grid(True, alpha=0.35)
-    axes[0].legend()
+    fig = plt.figure(figsize=(13, 14))
+    gridspec = fig.add_gridspec(6, 3, height_ratios=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
+    ax_bending = fig.add_subplot(gridspec[0, 0])
+    ax_twist = fig.add_subplot(gridspec[0, 1])
+    ax_twist_difference = fig.add_subplot(gridspec[0, 2])
+    ax_energy = fig.add_subplot(gridspec[1, :])
+    ax_displacement = fig.add_subplot(gridspec[2, :], sharex=ax_energy)
+    ax_velocity = fig.add_subplot(gridspec[3, :], sharex=ax_energy)
+    ax_angle_summary = fig.add_subplot(gridspec[4, :], sharex=ax_energy)
+    ax_convergence = fig.add_subplot(gridspec[5, :], sharex=ax_energy)
 
-    axes[1].plot(time, history["max_displacement"], color="tab:green")
-    axes[1].set_ylabel("Max displacement (m)")
-    axes[1].grid(True, alpha=0.35)
+    ax_bending.plot(
+        vertex_arc_positions,
+        final_bending_angles,
+        "o-",
+        color="tab:purple",
+        label="Final bending angle",
+    )
+    ax_bending.set_xlabel(vertex_xlabel)
+    ax_bending.set_ylabel("bending angle (rad)")
+    ax_bending.grid(True, alpha=0.35)
+    ax_bending.legend()
 
-    axes[2].plot(time, history["max_velocity_norm"], color="tab:purple")
-    axes[2].set_ylabel("Max node velocity")
-    axes[2].grid(True, alpha=0.35)
+    ax_twist.axhline(0.0, color="0.45", linewidth=1.0, alpha=0.6)
+    ax_twist.plot(
+        edge_midpoint_arc_positions,
+        final_twist_angles,
+        "o-",
+        color="tab:brown",
+        label="Final edge twist angle",
+    )
+    ax_twist.set_xlabel(edge_xlabel)
+    ax_twist.set_ylabel("twist angle (rad)")
+    ax_twist.grid(True, alpha=0.35)
+    ax_twist.legend()
 
-    axes[3].plot(time, history["max_bending_angle"], color="tab:purple", label="Bending angle")
-    axes[3].plot(time, history["max_abs_twist_angle"], color="tab:brown", label="|Twist angle|")
-    axes[3].plot(
+    ax_twist_difference.axhline(0.0, color="0.45", linewidth=1.0, alpha=0.6)
+    ax_twist_difference.plot(
+        vertex_arc_positions,
+        final_twist_differences,
+        "o-",
+        color="tab:red",
+        label="Final twist difference",
+    )
+    ax_twist_difference.set_xlabel(vertex_xlabel)
+    ax_twist_difference.set_ylabel("twist difference (rad)")
+    ax_twist_difference.grid(True, alpha=0.35)
+    ax_twist_difference.legend()
+
+    ax_energy.plot(time, history["total_energy"], label="Total energy")
+    ax_energy.plot(time, history["stretching_energy"], label="Stretching energy")
+    ax_energy.plot(time, history["bending_energy"], label="Bending energy")
+    ax_energy.plot(time, history["torsion_energy"], label="Torsion energy")
+    ax_energy.plot(time, history["kinetic_energy"], label="Translational kinetic")
+    ax_energy.plot(time, history["twist_kinetic_energy"], label="Twist kinetic")
+    ax_energy.set_ylabel("Energy (J)")
+    ax_energy.grid(True, alpha=0.35)
+    ax_energy.legend()
+
+    ax_displacement.plot(time, history["max_displacement"], color="tab:green")
+    ax_displacement.set_ylabel("Max displacement (m)")
+    ax_displacement.grid(True, alpha=0.35)
+
+    ax_velocity.plot(time, history["max_velocity_norm"], color="tab:purple")
+    ax_velocity.set_ylabel("Max node velocity")
+    ax_velocity.grid(True, alpha=0.35)
+
+    ax_angle_summary.plot(time, history["max_bending_angle"], color="tab:purple", label="Bending angle")
+    ax_angle_summary.plot(time, history["max_abs_twist_angle"], color="tab:brown", label="|Twist angle|")
+    ax_angle_summary.plot(
         time,
         history["max_abs_twist_difference"],
         color="tab:red",
         label="|Twist difference|",
     )
-    axes[3].set_ylabel("Angle summary (rad)")
-    axes[3].grid(True, alpha=0.35)
-    axes[3].legend()
+    ax_angle_summary.set_ylabel("Angle summary (rad)")
+    ax_angle_summary.grid(True, alpha=0.35)
+    ax_angle_summary.legend()
 
-    axes[4].plot(time, history["max_force_norm"], color="tab:red", label="Force")
-    axes[4].plot(time, history["max_torque_norm"], color="tab:brown", label="Torque")
-    axes[4].plot(
+    ax_convergence.plot(time, history["max_force_norm"], color="tab:red", label="Force")
+    ax_convergence.plot(time, history["max_torque_norm"], color="tab:brown", label="Torque")
+    ax_convergence.plot(
         time,
         history["max_twist_velocity_norm"],
         color="tab:gray",
         label="Twist velocity",
     )
-    axes[4].set_xlabel("Time (s)")
-    axes[4].set_ylabel("Convergence metrics")
-    axes[4].grid(True, alpha=0.35)
-    axes[4].legend()
+    ax_convergence.set_xlabel("Time (s)")
+    ax_convergence.set_ylabel("Convergence metrics")
+    ax_convergence.grid(True, alpha=0.35)
+    ax_convergence.legend()
 
-    fig.suptitle("3D Dynamic Simulation History")
+    fig.suptitle("Stretching + Bending + Torsion Diagnostics")
     plt.tight_layout()
     plt.show()
 
@@ -1033,10 +1103,15 @@ def parse_args() -> argparse.Namespace:
         default=1e-5,
         help="Tolerance for free-node velocity, force, twist velocity, and torque.",
     )
-    parser.add_argument("--save-every", type=int, default=10, help="Save history every N steps.")
-    parser.add_argument("--animate", action="store_true", help="Display the chain evolution animation.")
-    parser.add_argument("--animation-output", type=str, default=None, help="Path for saving animation GIF.")
-    parser.add_argument("--plot-history", action="store_true", help="Display energy and convergence history plots.")
+    parser.add_argument(
+        "--save-every",
+        type=int,
+        default=100,
+        help="Save history every N steps. Default 1000 gives 0.1 s between saved frames when dt=1e-4.",
+    )
+    parser.add_argument("--animate", action="store_true", help="Compatibility flag; animation is displayed by default unless --no-plot is used.")
+    parser.add_argument("--animation-output", type=str, default=None, help="Path for saving the dynamic-process GIF.")
+    parser.add_argument("--plot-history", action="store_true", help="Compatibility flag; diagnostics are displayed by default unless --no-plot is used.")
     parser.add_argument("--no-plot", action="store_true", help="Disable interactive plot windows.")
     return parser.parse_args()
 
@@ -1091,7 +1166,23 @@ def main() -> None:
 
     print_displacements_and_twist(initial_positions, final_state, args.force_node)
 
-    if not args.no_plot:
+    if args.no_plot:
+        if args.animate:
+            print("--animate was requested, but --no-plot is enabled; skipping interactive animation.")
+        if args.animation_output:
+            print("--animation-output was requested, but --no-plot is enabled; skipping GIF output.")
+        if args.plot_history:
+            print("--plot-history was requested, but --no-plot is enabled; skipping diagnostics.")
+    else:
+        animate_chain_evolution_3d(
+            initial_positions=initial_positions,
+            history=history,
+            rest_lengths=rest_lengths,
+            external_forces=external_forces,
+            force_node=args.force_node,
+            animation_output=args.animation_output,
+            show=True,
+        )
         visualize_chain_3d(
             initial_positions,
             final_state.positions,
@@ -1099,24 +1190,7 @@ def main() -> None:
             final_state.twist_angles,
             external_forces,
         )
-
-    if args.plot_history:
-        if args.no_plot:
-            print("--plot-history was requested, but --no-plot is enabled; skipping interactive history plots.")
-        else:
-            plot_time_history(history)
-
-    show_animation = args.animate and not args.no_plot
-    if args.animate and args.no_plot:
-        print("--animate was requested, but --no-plot is enabled; skipping interactive animation.")
-    if args.animation_output or show_animation:
-        animate_chain_evolution_3d(
-            initial_positions=initial_positions,
-            history=history,
-            rest_lengths=rest_lengths,
-            animation_output=args.animation_output,
-            show=show_animation,
-        )
+        plot_time_history(history, rest_lengths)
 
 
 if __name__ == "__main__":

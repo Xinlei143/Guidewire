@@ -416,16 +416,22 @@ def animate_chain_evolution(
         marker="s",
         label="Fixed node",
     )
-    force_marker = ax.scatter(
-        initial_positions[force_node, 0],
-        initial_positions[force_node, 1],
-        initial_positions[force_node, 2],
-        s=100,
-        facecolors="none",
-        edgecolors="tab:red",
-        linewidths=2,
-        label="Force node",
-    )
+    force_vector = external_forces[force_node]
+    force_norm = float(np.linalg.norm(force_vector))
+    force_scale = 0.1 / max(force_norm, 1e-12)
+    scaled_force = force_vector * force_scale
+    force_quiver = None
+    if force_norm > 0.0:
+        force_quiver = ax.quiver(
+            initial_positions[force_node, 0],
+            initial_positions[force_node, 1],
+            initial_positions[force_node, 2],
+            scaled_force[0],
+            scaled_force[1],
+            scaled_force[2],
+            color="tab:red",
+            label="External force",
+        )
 
     ax.set_xlim(min_xyz[0] - margin, max_xyz[0] + margin)
     ax.set_ylim(min_xyz[1] - margin, max_xyz[1] + margin)
@@ -437,16 +443,25 @@ def animate_chain_evolution(
     ax.legend(loc="best")
 
     def update(frame_index: int):
+        nonlocal force_quiver
         positions = positions_history[frame_index]
         current_line.set_data(positions[:, 0], positions[:, 1])
         current_line.set_3d_properties(positions[:, 2])
-        force_marker._offsets3d = (
-            positions[force_node : force_node + 1, 0],
-            positions[force_node : force_node + 1, 1],
-            positions[force_node : force_node + 1, 2],
-        )
+        if force_quiver is not None:
+            force_quiver.remove()
+            force_quiver = None
+        if force_norm > 0.0:
+            force_quiver = ax.quiver(
+                positions[force_node, 0],
+                positions[force_node, 1],
+                positions[force_node, 2],
+                scaled_force[0],
+                scaled_force[1],
+                scaled_force[2],
+                color="tab:red",
+            )
         ax.set_title(f"Stretching-only DER-style dynamics, t = {time_history[frame_index]:.4f} s")
-        return current_line, fixed_marker, force_marker
+        return current_line, fixed_marker
 
     animation = FuncAnimation(
         fig,
@@ -565,8 +580,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gravity", type=float, default=9.81, help="Gravitational acceleration in m/s^2.")
     parser.add_argument("--force-node", type=int, default=10, help="Node index where the external force is applied.")
     parser.add_argument("--force-x", type=float, default=1.0, help="External force x component in N.")
-    parser.add_argument("--force-y", type=float, default=0.0, help="External force y component in N.")
-    parser.add_argument("--force-z", type=float, default=0.0, help="External force z component in N.")
+    parser.add_argument("--force-y", type=float, default=1.0, help="External force y component in N.")
+    parser.add_argument("--force-z", type=float, default=1.0, help="External force z component in N.")
     parser.add_argument("--dt", type=float, default=1e-4, help="Time step size in seconds.")
     parser.add_argument("--steps", type=int, default=20000, help="Maximum number of time steps.")
     parser.add_argument("--damping", type=float, default=2.0, help="Nodal viscous damping coefficient.")
@@ -576,10 +591,15 @@ def parse_args() -> argparse.Namespace:
         default=1e-5,
         help="Tolerance for free-node max velocity and undamped residual force.",
     )
-    parser.add_argument("--save-every", type=int, default=10, help="Save history every N steps.")
-    parser.add_argument("--animate", action="store_true", help="Display the chain evolution animation.")
-    parser.add_argument("--animation-output", type=str, default=None, help="Path for saving animation GIF.")
-    parser.add_argument("--plot-history", action="store_true", help="Display energy and convergence history plots.")
+    parser.add_argument(
+        "--save-every",
+        type=int,
+        default=100,
+        help="Save history every N steps. Default 1000 gives 0.1 s between saved frames when dt=1e-4.",
+    )
+    parser.add_argument("--animate", action="store_true", help="Compatibility flag; animation is displayed by default unless --no-plot is used.")
+    parser.add_argument("--animation-output", type=str, default=None, help="Path for saving the dynamic-process GIF.")
+    parser.add_argument("--plot-history", action="store_true", help="Compatibility flag; diagnostics are displayed by default unless --no-plot is used.")
     parser.add_argument("--no-plot", action="store_true", help="Disable interactive plot windows.")
     return parser.parse_args()
 
@@ -622,27 +642,24 @@ def main() -> None:
 
     print_displacements(initial_positions, deformed_positions, args.force_node)
 
-    if not args.no_plot:
-        visualize_chain(initial_positions, deformed_positions, external_forces)
-
-    if args.plot_history:
-        if args.no_plot:
-            print("--plot-history was requested, but --no-plot is enabled; skipping interactive history plots.")
-        else:
-            plot_time_history(history)
-
-    show_animation = args.animate and not args.no_plot
-    if args.animate and args.no_plot:
-        print("--animate was requested, but --no-plot is enabled; skipping interactive animation.")
-    if args.animation_output or show_animation:
+    if args.no_plot:
+        if args.animate:
+            print("--animate was requested, but --no-plot is enabled; skipping interactive animation.")
+        if args.animation_output:
+            print("--animation-output was requested, but --no-plot is enabled; skipping GIF output.")
+        if args.plot_history:
+            print("--plot-history was requested, but --no-plot is enabled; skipping diagnostics.")
+    else:
         animate_chain_evolution(
             initial_positions=initial_positions,
             history=history,
             external_forces=external_forces,
             force_node=args.force_node,
             animation_output=args.animation_output,
-            show=show_animation,
+            show=True,
         )
+        visualize_chain(initial_positions, deformed_positions, external_forces)
+        plot_time_history(history)
 
 
 if __name__ == "__main__":

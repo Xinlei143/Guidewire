@@ -409,16 +409,12 @@ def visualize_chain(
     rest_lengths: np.ndarray,
     external_forces: np.ndarray,
 ) -> None:
-    """Plot 3D chain geometry and bending angle profile."""
+    """Plot undeformed chain, equilibrium chain, external force, and displacements."""
     plt, _ = load_matplotlib()
     displacements = deformed_positions - initial_positions
-    vertex_arc_positions = compute_vertex_arc_positions(rest_lengths)
-    bending_angles = compute_bending_angles(deformed_positions)
 
-    fig = plt.figure(figsize=(10, 8))
-    gridspec = fig.add_gridspec(2, 1, height_ratios=[2.0, 1.0])
-    ax_chain = fig.add_subplot(gridspec[0], projection="3d")
-    ax_angles = fig.add_subplot(gridspec[1])
+    fig = plt.figure(figsize=(9, 6))
+    ax_chain = fig.add_subplot(111, projection="3d")
     ax_chain.plot(
         initial_positions[:, 0],
         initial_positions[:, 1],
@@ -476,19 +472,6 @@ def visualize_chain(
     ax_chain.set_title("3D Soft Robot Chain Dynamic Equilibrium")
     set_axes_equal_3d(ax_chain)
     ax_chain.legend()
-
-    ax_angles.axhline(0.0, color="0.45", linewidth=1.0, alpha=0.6)
-    ax_angles.plot(
-        vertex_arc_positions,
-        bending_angles,
-        "o-",
-        color="tab:purple",
-        label="Bending angle",
-    )
-    ax_angles.set_xlabel("arc length at interior node (m)")
-    ax_angles.set_ylabel("bending angle (rad)")
-    ax_angles.grid(True, alpha=0.35)
-    ax_angles.legend()
     plt.tight_layout()
     plt.show()
 
@@ -536,16 +519,22 @@ def animate_chain_evolution(
         marker="s",
         label="Fixed node",
     )
-    force_marker = ax_chain.scatter(
-        initial_positions[force_node, 0],
-        initial_positions[force_node, 1],
-        initial_positions[force_node, 2],
-        s=100,
-        facecolors="none",
-        edgecolors="tab:red",
-        linewidths=2,
-        label="Force node",
-    )
+    force_vector = external_forces[force_node]
+    force_norm = float(np.linalg.norm(force_vector))
+    force_scale = 0.1 / max(force_norm, 1e-12)
+    scaled_force = force_vector * force_scale
+    force_quiver = None
+    if force_norm > 0.0:
+        force_quiver = ax_chain.quiver(
+            initial_positions[force_node, 0],
+            initial_positions[force_node, 1],
+            initial_positions[force_node, 2],
+            scaled_force[0],
+            scaled_force[1],
+            scaled_force[2],
+            color="tab:red",
+            label="External force",
+        )
 
     ax_chain.set_xlim(min_xyz[0] - margin, max_xyz[0] + margin)
     ax_chain.set_ylim(min_xyz[1] - margin, max_xyz[1] + margin)
@@ -580,6 +569,7 @@ def animate_chain_evolution(
     ax_angles.legend(loc="best")
 
     def update(frame_index: int):
+        nonlocal force_quiver
         positions = positions_history[frame_index]
         bending_angles = bending_angles_history[frame_index]
         if bending_angles.size:
@@ -588,18 +578,26 @@ def animate_chain_evolution(
             max_frame_bending_angle = 0.0
         current_line.set_data(positions[:, 0], positions[:, 1])
         current_line.set_3d_properties(positions[:, 2])
-        force_marker._offsets3d = (
-            positions[force_node : force_node + 1, 0],
-            positions[force_node : force_node + 1, 1],
-            positions[force_node : force_node + 1, 2],
-        )
+        if force_quiver is not None:
+            force_quiver.remove()
+            force_quiver = None
+        if force_norm > 0.0:
+            force_quiver = ax_chain.quiver(
+                positions[force_node, 0],
+                positions[force_node, 1],
+                positions[force_node, 2],
+                scaled_force[0],
+                scaled_force[1],
+                scaled_force[2],
+                color="tab:red",
+            )
         bending_angle_line.set_data(vertex_arc_positions, bending_angles)
         ax_chain.set_title(
             f"3D stretching + bending DER-style dynamics, "
             f"t = {time_history[frame_index]:.4f} s, "
             f"max |bend angle| = {max_frame_bending_angle:.4e} rad"
         )
-        return current_line, fixed_marker, force_marker, bending_angle_line
+        return current_line, fixed_marker, bending_angle_line
 
     animation = FuncAnimation(
         fig,
@@ -624,36 +622,59 @@ def animate_chain_evolution(
         plt.close(fig)
 
 
-def plot_time_history(history: dict[str, np.ndarray | bool | int | None]) -> None:
-    """Plot energy and convergence-related time histories."""
+def plot_time_history(
+    history: dict[str, np.ndarray | bool | int | None],
+    rest_lengths: np.ndarray | None = None,
+) -> None:
+    """Plot final bending profile plus energy and convergence diagnostics."""
     plt, _ = load_matplotlib()
     time = history["time"]
+    final_bending_angles = history["bending_angles"][-1]
+    if rest_lengths is None:
+        vertex_arc_positions = np.arange(final_bending_angles.size)
+        angle_xlabel = "interior node index"
+    else:
+        vertex_arc_positions = compute_vertex_arc_positions(rest_lengths)
+        angle_xlabel = "arc length at interior node (m)"
 
-    fig, axes = plt.subplots(4, 1, figsize=(9, 11), sharex=True)
-    axes[0].plot(time, history["total_energy"], label="Total energy")
-    axes[0].plot(time, history["stretching_energy"], label="Stretching energy")
-    axes[0].plot(time, history["bending_energy"], label="Bending energy")
-    axes[0].plot(time, history["kinetic_energy"], label="Kinetic energy")
-    axes[0].set_ylabel("Energy (J)")
+    fig, axes = plt.subplots(5, 1, figsize=(9, 13))
+    axes[0].axhline(0.0, color="0.45", linewidth=1.0, alpha=0.6)
+    axes[0].plot(
+        vertex_arc_positions,
+        final_bending_angles,
+        "o-",
+        color="tab:purple",
+        label="Final bending angle",
+    )
+    axes[0].set_xlabel(angle_xlabel)
+    axes[0].set_ylabel("Bending angle (rad)")
     axes[0].grid(True, alpha=0.35)
     axes[0].legend()
 
-    axes[1].plot(time, history["max_displacement"], color="tab:green")
-    axes[1].set_ylabel("Max displacement (m)")
+    axes[1].plot(time, history["total_energy"], label="Total energy")
+    axes[1].plot(time, history["stretching_energy"], label="Stretching energy")
+    axes[1].plot(time, history["bending_energy"], label="Bending energy")
+    axes[1].plot(time, history["kinetic_energy"], label="Kinetic energy")
+    axes[1].set_ylabel("Energy (J)")
     axes[1].grid(True, alpha=0.35)
+    axes[1].legend()
 
-    axes[2].plot(time, history["max_abs_bending_angle"], color="tab:purple")
-    axes[2].set_ylabel("Max |bend angle| (rad)")
+    axes[2].plot(time, history["max_displacement"], color="tab:green")
+    axes[2].set_ylabel("Max displacement (m)")
     axes[2].grid(True, alpha=0.35)
 
-    axes[3].plot(time, history["max_velocity_norm"], color="tab:purple", label="Max velocity")
-    axes[3].plot(time, history["max_force_norm"], color="tab:red", label="Max residual force")
-    axes[3].set_xlabel("Time (s)")
-    axes[3].set_ylabel("Convergence metrics")
+    axes[3].plot(time, history["max_abs_bending_angle"], color="tab:purple")
+    axes[3].set_ylabel("Max |bend angle| (rad)")
     axes[3].grid(True, alpha=0.35)
-    axes[3].legend()
 
-    fig.suptitle("Dynamic Simulation History")
+    axes[4].plot(time, history["max_velocity_norm"], color="tab:purple", label="Max velocity")
+    axes[4].plot(time, history["max_force_norm"], color="tab:red", label="Max residual force")
+    axes[4].set_xlabel("Time (s)")
+    axes[4].set_ylabel("Convergence metrics")
+    axes[4].grid(True, alpha=0.35)
+    axes[4].legend()
+
+    fig.suptitle("Stretching + Bending Diagnostics")
     plt.tight_layout()
     plt.show()
 
@@ -727,8 +748,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gravity", type=float, default=9.81, help="Gravitational acceleration in m/s^2.")
     parser.add_argument("--force-node", type=int, default=10, help="Node index where the external force is applied.")
     parser.add_argument("--force-x", type=float, default=1.0, help="External force x component in N.")
-    parser.add_argument("--force-y", type=float, default=0.0, help="External force y component in N.")
-    parser.add_argument("--force-z", type=float, default=0.0, help="External force z component in N.")
+    parser.add_argument("--force-y", type=float, default=1.0, help="External force y component in N.")
+    parser.add_argument("--force-z", type=float, default=1.0, help="External force z component in N.")
     parser.add_argument("--dt", type=float, default=1e-4, help="Time step size in seconds.")
     parser.add_argument("--steps", type=int, default=20000, help="Maximum number of time steps.")
     parser.add_argument("--damping", type=float, default=2.0, help="Nodal viscous damping coefficient.")
@@ -738,10 +759,15 @@ def parse_args() -> argparse.Namespace:
         default=1e-5,
         help="Tolerance for free-node max velocity and undamped residual force.",
     )
-    parser.add_argument("--save-every", type=int, default=10, help="Save history every N steps.")
-    parser.add_argument("--animate", action="store_true", help="Display the chain evolution animation.")
-    parser.add_argument("--animation-output", type=str, default=None, help="Path for saving animation GIF.")
-    parser.add_argument("--plot-history", action="store_true", help="Display energy and convergence history plots.")
+    parser.add_argument(
+        "--save-every",
+        type=int,
+        default=100,
+        help="Save history every N steps. Default 1000 gives 0.1 s between saved frames when dt=1e-4.",
+    )
+    parser.add_argument("--animate", action="store_true", help="Compatibility flag; animation is displayed by default unless --no-plot is used.")
+    parser.add_argument("--animation-output", type=str, default=None, help="Path for saving the dynamic-process GIF.")
+    parser.add_argument("--plot-history", action="store_true", help="Compatibility flag; diagnostics are displayed by default unless --no-plot is used.")
     parser.add_argument("--no-plot", action="store_true", help="Disable interactive plot windows.")
     return parser.parse_args()
 
@@ -785,24 +811,14 @@ def main() -> None:
 
     print_displacements(initial_positions, deformed_positions, args.force_node)
 
-    if not args.no_plot:
-        visualize_chain(
-            initial_positions,
-            deformed_positions,
-            rest_lengths,
-            external_forces,
-        )
-
-    if args.plot_history:
-        if args.no_plot:
-            print("--plot-history was requested, but --no-plot is enabled; skipping interactive history plots.")
-        else:
-            plot_time_history(history)
-
-    show_animation = args.animate and not args.no_plot
-    if args.animate and args.no_plot:
-        print("--animate was requested, but --no-plot is enabled; skipping interactive animation.")
-    if args.animation_output or show_animation:
+    if args.no_plot:
+        if args.animate:
+            print("--animate was requested, but --no-plot is enabled; skipping interactive animation.")
+        if args.animation_output:
+            print("--animation-output was requested, but --no-plot is enabled; skipping GIF output.")
+        if args.plot_history:
+            print("--plot-history was requested, but --no-plot is enabled; skipping diagnostics.")
+    else:
         animate_chain_evolution(
             initial_positions=initial_positions,
             history=history,
@@ -810,8 +826,15 @@ def main() -> None:
             external_forces=external_forces,
             force_node=args.force_node,
             animation_output=args.animation_output,
-            show=show_animation,
+            show=True,
         )
+        visualize_chain(
+            initial_positions,
+            deformed_positions,
+            rest_lengths,
+            external_forces,
+        )
+        plot_time_history(history, rest_lengths)
 
 
 if __name__ == "__main__":
