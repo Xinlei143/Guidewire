@@ -29,6 +29,21 @@ conda run -n Env python soft_robot_chain_bending_stretching.py --bend-stiffness 
 ```
 
 ```text
+soft_robot_chain_bending_stretching_pytorch.py
+```
+
+3D stretching + bending chain with the same energy, CLI, diagnostics, and
+visualizations as `soft_robot_chain_bending_stretching.py`. Stretching forces
+stay analytic NumPy code, while bending forces are computed as the negative
+PyTorch autograd gradient of the bending energy instead of a finite-difference
+gradient.
+
+```bash
+conda run -n Env python soft_robot_chain_bending_stretching_pytorch.py --no-plot
+conda run -n Env python soft_robot_chain_bending_stretching_pytorch.py --bend-stiffness 0.05 --force-z 0.1
+```
+
+```text
 soft_robot_chain_bending_stretching_torsion.py
 ```
 
@@ -72,11 +87,17 @@ execution entry points.
 
 ## Implementation Notes
 
-- The current bending force is computed as the negative central finite
-  difference gradient of the 3D centerline bending energy. This is slower than
-  an analytic force formula but easier to verify while developing the model.
+- `soft_robot_chain_bending_stretching.py` computes bending force as the
+  negative central finite-difference gradient of the 3D centerline bending
+  energy. This is slower than an analytic force formula but easy to verify
+  while developing the model.
+- `soft_robot_chain_bending_stretching_pytorch.py` keeps the same bending
+  energy formula, but computes bending force with PyTorch automatic
+  differentiation on CPU using float64 tensors. It is intended for comparison
+  against the finite-difference baseline.
 - The torsion stage uses a minimal twist-angle model. It is a practical third
   stage scaffold, not a complete material-frame DER implementation yet.
 - Scripts are intentionally independent so results from one physical stage can
   be preserved and compared against later stages.
 - Python dependencies are expected to come from the `Env` conda environment.
+  The PyTorch autograd script additionally requires `torch` in that environment.
