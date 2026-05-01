@@ -573,22 +573,22 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--num-links", type=int, default=10, help="Number of serial links.")
-    parser.add_argument("--total-length", type=float, default=1.0, help="Initial total length in meters.")
+    parser.add_argument("--total-length", type=float, default=2.0, help="Initial total length in meters.")
     parser.add_argument(
         "--stretch-stiffness",
         "--stiffness",
         dest="stretch_stiffness",
         type=float,
-        default=1000.0,
+        default=5000.0,
         help="Axial stretching stiffness in N/m. --stiffness is kept as a compatibility alias.",
     )
-    parser.add_argument("--node-mass", type=float, default=0.01, help="Mass of each free node in kg.")
+    parser.add_argument("--node-mass", type=float, default=0.2, help="Mass of each free node in kg.")
     parser.add_argument("--gravity", type=float, default=9.81, help="Gravitational acceleration in m/s^2.")
     parser.add_argument("--force-node", type=int, default=5, help="Node index where the external force is applied.")
-    parser.add_argument("--force-x", type=float, default=1.0, help="External force x component in N.")
-    parser.add_argument("--force-y", type=float, default=1.0, help="External force y component in N.")
-    parser.add_argument("--force-z", type=float, default=1.0, help="External force z component in N.")
-    parser.add_argument("--dt", type=float, default=1e-4, help="Time step size in seconds.")
+    parser.add_argument("--force-x", type=float, default=10.0, help="External force x component in N.")
+    parser.add_argument("--force-y", type=float, default=0.0, help="External force y component in N.")
+    parser.add_argument("--force-z", type=float, default=0.0, help="External force z component in N.")
+    parser.add_argument("--dt", type=float, default=2e-4, help="Time step size in seconds.")
     parser.add_argument("--steps", type=int, default=100000, help="Maximum number of time steps.")
     parser.add_argument("--damping", type=float, default=0.5, help="Nodal viscous damping coefficient.")
     parser.add_argument(
@@ -600,7 +600,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--save-every",
         type=int,
-        default=1000,
+        default=500,
         help="Save history every N steps. Default 1000 gives 0.1 s between saved frames when dt=1e-4.",
     )
     parser.add_argument("--animate", action="store_true", help="Compatibility flag; animation is displayed by default unless --no-plot is used.")

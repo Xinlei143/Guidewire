@@ -66,18 +66,20 @@ def compute_bending_angles(
     positions: np.ndarray,
     min_length: float = 1e-12,
 ) -> np.ndarray:
-    """Return unsigned bending angles between neighboring 3D edge tangents."""
+    """Return discrete curvature-binormal magnitudes between neighboring edges."""
     if positions.shape[0] < 3:
         return np.empty(0)
 
     _, lengths, tangents = compute_edge_geometry(positions, min_length)
     dot_products = np.sum(tangents[:-1] * tangents[1:], axis=1)
-    dot_products = np.clip(dot_products, -1.0, 1.0)
-    angles = np.arccos(dot_products)
+    denominators = np.maximum(1.0 + dot_products, min_length)
+    cross_products = np.cross(tangents[:-1], tangents[1:])
+    curvature_binormals = 2.0 * cross_products / denominators[:, None]
+    curvature_magnitudes = np.linalg.norm(curvature_binormals, axis=1)
 
     valid_vertices = (lengths[:-1] > min_length) & (lengths[1:] > min_length)
-    angles[~valid_vertices] = 0.0
-    return angles
+    curvature_magnitudes[~valid_vertices] = 0.0
+    return curvature_magnitudes
 
 
 def bending_energy(
@@ -817,7 +819,7 @@ def animate_chain_evolution_3d(
         else 0.0
     )
 
-    bending_line, = ax_bending.plot([], [], "o-", color="tab:purple", label="Bending angle")
+    bending_line, = ax_bending.plot([], [], "o-", color="tab:purple", label="Curvature magnitude")
     twist_line, = ax_twist.plot([], [], "o-", color="tab:brown", label="Edge twist angle")
     twist_difference_line, = ax_twist_difference.plot(
         [],
@@ -831,7 +833,7 @@ def animate_chain_evolution_3d(
     ax_bending.set_xlim(0.0, total_length)
     ax_bending.set_ylim(-0.05 * max(max_bending_angle, 1.0), max_bending_angle + 0.1 * max(max_bending_angle, 1.0))
     ax_bending.set_xlabel("arc length at interior node (m)")
-    ax_bending.set_ylabel("bending angle (rad)")
+    ax_bending.set_ylabel("||kappa_b||")
     ax_bending.grid(True, alpha=0.35)
     ax_bending.legend(loc="best")
 
@@ -962,10 +964,10 @@ def plot_time_history(
         final_bending_angles,
         "o-",
         color="tab:purple",
-        label="Final bending angle",
+        label="Final curvature magnitude",
     )
     ax_bending.set_xlabel(vertex_xlabel)
-    ax_bending.set_ylabel("bending angle (rad)")
+    ax_bending.set_ylabel("||kappa_b||")
     ax_bending.grid(True, alpha=0.35)
     ax_bending.legend()
 
@@ -1013,7 +1015,7 @@ def plot_time_history(
     ax_velocity.set_ylabel("Max node velocity")
     ax_velocity.grid(True, alpha=0.35)
 
-    ax_angle_summary.plot(time, history["max_bending_angle"], color="tab:purple", label="Bending angle")
+    ax_angle_summary.plot(time, history["max_bending_angle"], color="tab:purple", label="Curvature magnitude")
     ax_angle_summary.plot(time, history["max_abs_twist_angle"], color="tab:brown", label="|Twist angle|")
     ax_angle_summary.plot(
         time,
@@ -1081,19 +1083,19 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--num-links", type=int, default=10, help="Number of serial links.")
-    parser.add_argument("--total-length", type=float, default=1.0, help="Initial total length in meters.")
-    parser.add_argument("--stretch-stiffness", type=float, default=1000.0, help="Axial stretching stiffness in N/m.")
+    parser.add_argument("--total-length", type=float, default=2.0, help="Initial total length in meters.")
+    parser.add_argument("--stretch-stiffness", type=float, default=15000.0, help="Axial stretching stiffness in N/m.")
     parser.add_argument("--bend-stiffness", type=float, default=0.01, help="3D bending stiffness.")
     parser.add_argument("--twist-stiffness", type=float, default=0.01, help="Torsional stiffness.")
-    parser.add_argument("--node-mass", type=float, default=0.01, help="Mass of each free node in kg.")
+    parser.add_argument("--node-mass", type=float, default=0.2, help="Mass of each free node in kg.")
     parser.add_argument("--edge-inertia", type=float, default=1e-4, help="Rotational inertia of each twist edge.")
     parser.add_argument("--gravity", type=float, default=9.81, help="Gravitational acceleration in m/s^2.")
     parser.add_argument("--force-node", type=int, default=10, help="Node index where the external force is applied.")
-    parser.add_argument("--force-x", type=float, default=1.0, help="External force x component in N.")
-    parser.add_argument("--force-y", type=float, default=1.0, help="External force y component in N.")
-    parser.add_argument("--force-z", type=float, default=1.0, help="External force z component in N.")
+    parser.add_argument("--force-x", type=float, default=10.0, help="External force x component in N.")
+    parser.add_argument("--force-y", type=float, default=0.0, help="External force y component in N.")
+    parser.add_argument("--force-z", type=float, default=0.0, help="External force z component in N.")
     parser.add_argument("--initial-tip-twist", type=float, default=0.0, help="Initial twist angle on the last edge in radians.")
-    parser.add_argument("--dt", type=float, default=1e-4, help="Time step size in seconds.")
+    parser.add_argument("--dt", type=float, default=2e-4, help="Time step size in seconds.")
     parser.add_argument("--steps", type=int, default=20000, help="Maximum number of time steps.")
     parser.add_argument("--damping", type=float, default=2.0, help="Nodal viscous damping coefficient.")
     parser.add_argument("--twist-damping", type=float, default=0.02, help="Viscous damping coefficient for twist angles.")
@@ -1106,7 +1108,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--save-every",
         type=int,
-        default=100,
+        default=500,
         help="Save history every N steps. Default 1000 gives 0.1 s between saved frames when dt=1e-4.",
     )
     parser.add_argument("--animate", action="store_true", help="Compatibility flag; animation is displayed by default unless --no-plot is used.")

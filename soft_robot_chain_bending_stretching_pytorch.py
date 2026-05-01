@@ -48,18 +48,20 @@ def compute_bending_angles(
     positions: np.ndarray,
     min_length: float = 1e-12,
 ) -> np.ndarray:
-    """Return unsigned bending angles between neighboring 3D edge tangents."""
+    """Return discrete curvature-binormal magnitudes between neighboring edges."""
     if positions.shape[0] < 3:
         return np.empty(0)
 
     _, lengths, tangents = compute_edge_geometry(positions, min_length)
     dot_products = np.sum(tangents[:-1] * tangents[1:], axis=1)
-    dot_products = np.clip(dot_products, -1.0, 1.0)
-    angles = np.arccos(dot_products)
+    denominators = np.maximum(1.0 + dot_products, min_length)
+    cross_products = np.cross(tangents[:-1], tangents[1:])
+    curvature_binormals = 2.0 * cross_products / denominators[:, None]
+    curvature_magnitudes = np.linalg.norm(curvature_binormals, axis=1)
 
     valid_vertices = (lengths[:-1] > min_length) & (lengths[1:] > min_length)
-    angles[~valid_vertices] = 0.0
-    return angles
+    curvature_magnitudes[~valid_vertices] = 0.0
+    return curvature_magnitudes
 
 
 def bending_energy(
@@ -92,15 +94,20 @@ def bending_energy_torch(
     tangents = edge_vectors / safe_lengths[:, None]
 
     dot_products = torch.sum(tangents[:-1] * tangents[1:], dim=1)
-    # Keep acos away from +/-1 so autograd does not encounter singular slopes.
-    dot_products = torch.clamp(dot_products, -1.0 + min_length, 1.0 - min_length)
-    angles = torch.acos(dot_products)
+    denominators = torch.clamp(1.0 + dot_products, min=min_length)
+    cross_products = torch.linalg.cross(tangents[:-1], tangents[1:], dim=1)
+    curvature_binormals = 2.0 * cross_products / denominators[:, None]
+    curvature_magnitudes = torch.linalg.norm(curvature_binormals, dim=1)
 
     valid_vertices = (lengths[:-1] > min_length) & (lengths[1:] > min_length)
-    angles = torch.where(valid_vertices, angles, torch.zeros_like(angles))
+    curvature_magnitudes = torch.where(
+        valid_vertices,
+        curvature_magnitudes,
+        torch.zeros_like(curvature_magnitudes),
+    )
     vertex_lengths = 0.5 * (rest_lengths[:-1] + rest_lengths[1:])
     vertex_lengths = torch.clamp(vertex_lengths, min=min_length)
-    return 0.5 * stiffness * torch.sum(angles**2 / vertex_lengths)
+    return 0.5 * stiffness * torch.sum(curvature_magnitudes**2 / vertex_lengths)
 
 
 def compute_bending_forces_autograd(
@@ -579,7 +586,7 @@ def animate_chain_evolution(
         [],
         "o-",
         color="tab:purple",
-        label="Bending angle",
+        label="Curvature magnitude",
     )
     ax_angles.set_xlim(
         0.0,
@@ -590,7 +597,7 @@ def animate_chain_evolution(
         max_abs_bending_angle + angle_margin,
     )
     ax_angles.set_xlabel("arc length at interior node (m)")
-    ax_angles.set_ylabel("bending angle (rad)")
+    ax_angles.set_ylabel("||kappa_b||")
     ax_angles.grid(True, alpha=0.35)
     ax_angles.legend(loc="best")
 
@@ -621,7 +628,7 @@ def animate_chain_evolution(
         ax_chain.set_title(
             f"3D stretching + bending DER-style dynamics, "
             f"t = {time_history[frame_index]:.4f} s, "
-            f"max |bend angle| = {max_frame_bending_angle:.4e} rad"
+            f"max ||kappa_b|| = {max_frame_bending_angle:.4e}"
         )
         return current_line, fixed_marker, bending_angle_line
 
@@ -670,10 +677,10 @@ def plot_time_history(
         final_bending_angles,
         "o-",
         color="tab:purple",
-        label="Final bending angle",
+        label="Final curvature magnitude",
     )
     axes[0].set_xlabel(angle_xlabel)
-    axes[0].set_ylabel("Bending angle (rad)")
+    axes[0].set_ylabel("||kappa_b||")
     axes[0].grid(True, alpha=0.35)
     axes[0].legend()
 
@@ -690,7 +697,7 @@ def plot_time_history(
     axes[2].grid(True, alpha=0.35)
 
     axes[3].plot(time, history["max_abs_bending_angle"], color="tab:purple")
-    axes[3].set_ylabel("Max |bend angle| (rad)")
+    axes[3].set_ylabel("Max ||kappa_b||")
     axes[3].grid(True, alpha=0.35)
 
     axes[4].plot(time, history["max_velocity_norm"], color="tab:purple", label="Max velocity")
@@ -757,26 +764,26 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--num-links", type=int, default=10, help="Number of serial links.")
-    parser.add_argument("--total-length", type=float, default=1.0, help="Initial total length in meters.")
+    parser.add_argument("--total-length", type=float, default=2.0, help="Initial total length in meters.")
     parser.add_argument(
         "--stretch-stiffness",
         type=float,
-        default=1000.0,
+        default=5000.0,
         help="Axial stretching stiffness in N/m.",
     )
     parser.add_argument(
         "--bend-stiffness",
         type=float,
-        default=0.01,
+        default=0.5,
         help="3D bending stiffness.",
     )
-    parser.add_argument("--node-mass", type=float, default=0.01, help="Mass of each free node in kg.")
+    parser.add_argument("--node-mass", type=float, default=0.2, help="Mass of each free node in kg.")
     parser.add_argument("--gravity", type=float, default=9.81, help="Gravitational acceleration in m/s^2.")
     parser.add_argument("--force-node", type=int, default=5, help="Node index where the external force is applied.")
-    parser.add_argument("--force-x", type=float, default=1.0, help="External force x component in N.")
-    parser.add_argument("--force-y", type=float, default=1.0, help="External force y component in N.")
-    parser.add_argument("--force-z", type=float, default=1.0, help="External force z component in N.")
-    parser.add_argument("--dt", type=float, default=1e-4, help="Time step size in seconds.")
+    parser.add_argument("--force-x", type=float, default=10.0, help="External force x component in N.")
+    parser.add_argument("--force-y", type=float, default=0.0, help="External force y component in N.")
+    parser.add_argument("--force-z", type=float, default=0.0, help="External force z component in N.")
+    parser.add_argument("--dt", type=float, default=2e-4, help="Time step size in seconds.")
     parser.add_argument("--steps", type=int, default=60000, help="Maximum number of time steps.")
     parser.add_argument("--damping", type=float, default=0.5, help="Nodal viscous damping coefficient.")
     parser.add_argument(
@@ -788,7 +795,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--save-every",
         type=int,
-        default=1000,
+        default=500,
         help="Save history every N steps. Default 1000 gives 0.1 s between saved frames when dt=1e-4.",
     )
     parser.add_argument("--animate", action="store_true", help="Compatibility flag; animation is displayed by default unless --no-plot is used.")
