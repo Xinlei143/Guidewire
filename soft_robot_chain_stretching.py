@@ -491,24 +491,30 @@ def plot_time_history(history: dict[str, np.ndarray | bool | int | None]) -> Non
     plt, _ = load_matplotlib()
     time = history["time"]
 
-    fig, axes = plt.subplots(3, 1, figsize=(9, 9), sharex=True)
+    fig, axes = plt.subplots(4, 1, figsize=(9, 11), sharex=True)
     axes[0].plot(time, history["total_energy"], label="Total energy")
-    axes[0].plot(time, history["stretching_energy"], label="Stretching energy")
-    axes[0].plot(time, history["kinetic_energy"], label="Kinetic energy")
+    axes[0].plot(time, history["gravitational_energy"], label="Gravitational potential")
+    axes[0].plot(time, history["external_energy"], label="External-force potential")
     axes[0].set_ylabel("Energy (J)")
     axes[0].grid(True, alpha=0.35)
     axes[0].legend()
 
-    axes[1].plot(time, history["max_displacement"], color="tab:green")
-    axes[1].set_ylabel("Max displacement (m)")
+    axes[1].plot(time, history["stretching_energy"], label="Stretching energy")
+    axes[1].plot(time, history["kinetic_energy"], label="Kinetic energy")
+    axes[1].set_ylabel("Energy (J)")
     axes[1].grid(True, alpha=0.35)
+    axes[1].legend()
 
-    axes[2].plot(time, history["max_velocity_norm"], color="tab:purple", label="Max velocity")
-    axes[2].plot(time, history["max_force_norm"], color="tab:red", label="Max residual force")
-    axes[2].set_xlabel("Time (s)")
-    axes[2].set_ylabel("Convergence metrics")
+    axes[2].plot(time, history["max_displacement"], color="tab:green")
+    axes[2].set_ylabel("Max displacement (m)")
     axes[2].grid(True, alpha=0.35)
-    axes[2].legend()
+
+    axes[3].plot(time, history["max_velocity_norm"], color="tab:purple", label="Max velocity")
+    axes[3].plot(time, history["max_force_norm"], color="tab:red", label="Max residual force")
+    axes[3].set_xlabel("Time (s)")
+    axes[3].set_ylabel("Convergence metrics")
+    axes[3].grid(True, alpha=0.35)
+    axes[3].legend()
 
     fig.suptitle("Dynamic Simulation History")
     plt.tight_layout()
@@ -579,12 +585,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--node-mass", type=float, default=0.01, help="Mass of each free node in kg.")
     parser.add_argument("--gravity", type=float, default=9.81, help="Gravitational acceleration in m/s^2.")
     parser.add_argument("--force-node", type=int, default=5, help="Node index where the external force is applied.")
-    parser.add_argument("--force-x", type=float, default=0.0, help="External force x component in N.")
-    parser.add_argument("--force-y", type=float, default=0.0, help="External force y component in N.")
+    parser.add_argument("--force-x", type=float, default=1.0, help="External force x component in N.")
+    parser.add_argument("--force-y", type=float, default=1.0, help="External force y component in N.")
     parser.add_argument("--force-z", type=float, default=1.0, help="External force z component in N.")
     parser.add_argument("--dt", type=float, default=1e-4, help="Time step size in seconds.")
-    parser.add_argument("--steps", type=int, default=500000, help="Maximum number of time steps.")
-    parser.add_argument("--damping", type=float, default=2.0, help="Nodal viscous damping coefficient.")
+    parser.add_argument("--steps", type=int, default=100000, help="Maximum number of time steps.")
+    parser.add_argument("--damping", type=float, default=0.5, help="Nodal viscous damping coefficient.")
     parser.add_argument(
         "--convergence-tol",
         type=float,
