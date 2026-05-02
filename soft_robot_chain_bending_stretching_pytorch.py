@@ -777,12 +777,12 @@ def parse_args() -> argparse.Namespace:
         default=0.5,
         help="3D bending stiffness.",
     )
-    parser.add_argument("--node-mass", type=float, default=0.2, help="Mass of each free node in kg.")
+    parser.add_argument("--node-mass", type=float, default=0.1, help="Mass of each free node in kg.")
     parser.add_argument("--gravity", type=float, default=9.81, help="Gravitational acceleration in m/s^2.")
     parser.add_argument("--force-node", type=int, default=5, help="Node index where the external force is applied.")
-    parser.add_argument("--force-x", type=float, default=10.0, help="External force x component in N.")
-    parser.add_argument("--force-y", type=float, default=0.0, help="External force y component in N.")
-    parser.add_argument("--force-z", type=float, default=0.0, help="External force z component in N.")
+    parser.add_argument("--force-x", type=float, default=5.0, help="External force x component in N.")
+    parser.add_argument("--force-y", type=float, default=5.0, help="External force y component in N.")
+    parser.add_argument("--force-z", type=float, default=5.0, help="External force z component in N.")
     parser.add_argument("--dt", type=float, default=2e-4, help="Time step size in seconds.")
     parser.add_argument("--steps", type=int, default=60000, help="Maximum number of time steps.")
     parser.add_argument("--damping", type=float, default=0.5, help="Nodal viscous damping coefficient.")
