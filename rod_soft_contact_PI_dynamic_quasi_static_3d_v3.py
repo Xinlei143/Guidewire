@@ -779,48 +779,6 @@ def assemble_elastic_block_penta_v3(
     return gradient.reshape(-1), system, block_plan.free_start, block_plan.free_end
 
 
-def assemble_elastic_gradient_only_v3(
-    positions: torch.Tensor,
-    rest_lengths: torch.Tensor,
-    prescribed_mask: torch.Tensor,
-    ea: float,
-    ei: float,
-    block_plan: BlockAssemblyPlan | None = None,
-) -> torch.Tensor:
-    """Assemble only the free-coordinate elastic gradient for residual trials.
-
-    Stretch remains closed form and each bending element is differentiated
-    independently with a batched first-order transform.  No global energy
-    graph or Hessian is constructed, which is the path needed by line search.
-    """
-    block_plan = block_plan or _fallback_block_assembly_plan(positions, prescribed_mask)
-    gradient = torch.zeros(
-        (block_plan.block_count, 3), dtype=positions.dtype, device=positions.device
-    )
-
-    stretch_grad, _ = stretch_grad_hessian_analytic(positions, rest_lengths, ea)
-    stretch_plan = block_plan.stretch
-    gradient.index_add_(
-        0,
-        stretch_plan.grad_destination,
-        stretch_grad.reshape(-1, 2, 3)[stretch_plan.grad_element, stretch_plan.grad_local],
-    )
-
-    def bend_energy(flat: torch.Tensor, left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
-        return local_bending_energy(flat.reshape(3, 3), left, right, ei)
-
-    bend_grad_fn = torch.func.grad(bend_energy, argnums=0)
-    bend_dofs = torch.cat((positions[:-2], positions[1:-1], positions[2:]), dim=1)
-    bend_grad = torch.func.vmap(bend_grad_fn)(bend_dofs, rest_lengths[:-1], rest_lengths[1:])
-    bend_plan = block_plan.bend
-    gradient.index_add_(
-        0,
-        bend_plan.grad_destination,
-        bend_grad.reshape(-1, 3, 3)[bend_plan.grad_element, bend_plan.grad_local],
-    )
-    return gradient.reshape(-1)
-
-
 def residual_and_jacobian(
     q: torch.Tensor,
     old_positions: torch.Tensor,
@@ -852,20 +810,13 @@ def residual_and_jacobian(
                 positions, integrals, previous_errors, block_plan, args
             )
     else:
-        if getattr(args, "compute_kernels", "optimized") == "reference":
-            # Reference residual path: a fresh leaf prevents gradients from
-            # leaking into the Newton caller while retaining the old global
-            # elastic-energy differentiation.
-            q_grad = q.detach().requires_grad_(True)
-            _, _, energy = elastic_energy(
-                unpack(q_grad, free_mask, prescribed), rest_lengths, args.EA, args.EI
-            )
-            gradient = torch.autograd.grad(energy, q_grad)[0]
-        else:
-            block_plan = block_plan or _fallback_block_assembly_plan(positions, prescribed_mask)
-            gradient = assemble_elastic_gradient_only_v3(
-                positions, rest_lengths, prescribed_mask, args.EA, args.EI, block_plan
-            )
+        # Residual-only trials retain the established global elastic gradient:
+        # on this v3 bending kernel it is faster than local first-order vmap.
+        q_grad = q.detach().requires_grad_(True)
+        _, _, energy = elastic_energy(
+            unpack(q_grad, free_mask, prescribed), rest_lengths, args.EA, args.EI
+        )
+        gradient = torch.autograd.grad(energy, q_grad)[0]
         all_contact, *_ = contact_quantities(positions, integrals, previous_errors, args)
         contact_force = all_contact[free_mask]
         contact_blocks = None
