@@ -70,6 +70,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--animation-output", type=str, default=None, help="Path for saving the dynamic-process GIF.")
     parser.add_argument("--plot-history", action="store_true", help="Compatibility flag; diagnostics are shown unless --no-plot is used.")
     parser.add_argument("--no-plot", action="store_true", help="Disable interactive plot windows.")
+    parser.add_argument(
+        "--device",
+        choices=("auto", "cuda", "cpu"),
+        default="cpu",
+        help="Compute device. Default auto uses CUDA when available, otherwise CPU.",
+    )
+    parser.add_argument("--no-progress", action="store_true", help="Disable the simulation progress bar.")
     return parser.parse_args()
 
 
@@ -118,12 +125,41 @@ def print_summary(result: SimulationResult, max_steps: int) -> None:
         print(f"Simulation did not converge within {max_steps} steps.")
 
 
+def resolve_device(device_arg: str) -> torch.device:
+    """Return the requested compute device, preferring CUDA for auto."""
+    if device_arg == "cpu":
+        return torch.device("cpu")
+
+    cuda_available = torch.cuda.is_available()
+    if device_arg == "cuda":
+        if not cuda_available:
+            raise RuntimeError("--device cuda was requested, but CUDA is not available.")
+        return torch.device("cuda")
+
+    if cuda_available:
+        return torch.device("cuda")
+
+    print("CUDA is not available; falling back to CPU.")
+    return torch.device("cpu")
+
+
+def print_device_info(device: torch.device) -> None:
+    """Print the actual compute device used by the simulation."""
+    if device.type == "cuda":
+        print(f"Using device: {device} ({torch.cuda.get_device_name(device)})")
+    else:
+        print(f"Using device: {device}")
+
+
 def main() -> None:
     args = parse_args()
     if args.num_links < 2:
         raise ValueError("num-links must be at least 2 for the default clamped edge.")
 
-    rest = make_straight_rest_state(args.num_links, args.total_length)
+    device = resolve_device(args.device)
+    print_device_info(device)
+
+    rest = make_straight_rest_state(args.num_links, args.total_length, device=device)
     initial_positions = rest.positions.clone()
     num_nodes = initial_positions.shape[0]
     fixed_indices = (0, 1)
@@ -133,12 +169,14 @@ def main() -> None:
         num_nodes=num_nodes,
         value=args.node_mass,
         fixed_indices=fixed_indices,
+        device=device,
     )
     external_forces = build_external_forces(
         num_nodes,
         force_node,
         (args.force_x, args.force_y, args.force_z),
         fixed_indices=fixed_indices,
+        device=device,
     )
 
     result = run_dynamic_relaxation(
@@ -153,6 +191,7 @@ def main() -> None:
             damping=args.damping,
             convergence_tol=args.convergence_tol,
             save_every=args.save_every,
+            show_progress=not args.no_progress,
         ),
     )
     history = result.history_dict()

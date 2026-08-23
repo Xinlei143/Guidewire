@@ -44,6 +44,7 @@ class SolverOptions:
     damping: float
     convergence_tol: float
     save_every: int = 1
+    show_progress: bool = False
 
 
 @dataclass
@@ -403,7 +404,16 @@ def run_dynamic_relaxation(
     last_saved_step = 0
 
     final_step = 0
-    for step in range(1, options.steps + 1):
+    step_iterator = range(1, options.steps + 1)
+    if options.show_progress:
+        try:
+            from tqdm import tqdm
+
+            step_iterator = tqdm(step_iterator, total=options.steps, desc="Simulating", unit="step")
+        except ImportError:
+            pass
+
+    for step in step_iterator:
         internal = elastic_internal_forces(positions, rest, params)
         residual_forces = internal + nodal_forces + gravity_forces
         damping_forces = -options.damping * velocities

@@ -7,6 +7,7 @@ import unittest
 import torch
 
 from der_no_twist_model import RodParams, make_straight_rest_state, make_uniform_node_masses
+from run_cantilever_demo import resolve_device
 from semi_implicit_solver import (
     BoundaryCondition,
     ExternalLoads,
@@ -17,6 +18,13 @@ from semi_implicit_solver import (
 
 
 class TestCantileverDemo(unittest.TestCase):
+    def test_resolve_device_can_force_cpu(self) -> None:
+        self.assertEqual(resolve_device("cpu"), torch.device("cpu"))
+
+    def test_solver_progress_is_disabled_by_default(self) -> None:
+        options = SolverOptions(dt=2e-4, steps=2, damping=0.5, convergence_tol=1e-5)
+        self.assertFalse(options.show_progress)
+
     def test_short_b_zero_relaxation_runs(self) -> None:
         fixed_indices = (0, 1)
         rest = make_straight_rest_state(num_links=5, total_length=1.0)
