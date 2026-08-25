@@ -20,6 +20,10 @@ import numpy as np
 import torch
 import der_cpp_backend
 import torch.nn.functional as F
+import mesh_contact_v4
+
+
+ROOT = Path(__file__).resolve().parent
 
 
 # ==================== 常用参数区：通常只需修改这里 ====================
@@ -28,6 +32,8 @@ DTYPE = torch.float64
 # 计算设备："cuda" 强制使用 NVIDIA GPU；"cpu" 强制使用 CPU；"auto" 优先 GPU、不可用时自动回退 CPU。
 DEVICE_DEFAULT = "auto"
 BACKEND_DEFAULT = "cpp"
+CONTACT_TYPE_DEFAULT = "tube"
+MESH_OBJ_DEFAULT = ROOT / "tube_obj" / "straight_tube_L1p5m_boundaryR50mm_shellR60mm_32sides_axial2.obj"
 
 # --- 导丝材料与离散 ---
 TOTAL_LENGTH = 1.5                 # 导丝初始长度；x 轴方向从 0 延伸到该值
@@ -49,7 +55,7 @@ CONTACT_SMOOTH_LENGTH = 2e-5       # 接触开启的平滑长度；越大接触�
 DIRECTION_EPSILON = 1e-6           # 节点在管轴上时用于避免径向单位向量除零
 
 # --- 准静态求解与平衡判据 ---
-DT = 0.1                          # 隐式 Euler 单步时间；仅用于脉冲/松弛，不代表真实加载时间
+DT = 0.02                          # 隐式 Euler 单步时间；仅用于脉冲/松弛，不代表真实加载时间
 MAX_NEWTON_ITERS = 200             # 每个隐式步允许的 Newton 最大迭代次数
 NEWTON_RESIDUAL_TOL = 1e-7         # 单个 Newton 步的力残差收敛阈值
 NEWTON_STEP_TOL = 1e-10            # Newton 位移修正很小时的停止阈值
@@ -61,7 +67,7 @@ MAX_SETTLE_STEPS = 16000           # 一个载荷步最多松弛步数，超出�
 
 # --- 右端位移控制压缩 ---
 TIP_TOTAL_DISPLACEMENT = 90e-3     # 最后一个节点总共向 -x 压缩的距离
-NUM_LOAD_STEPS = 10                # 总压缩位移分成多少个载荷步
+NUM_LOAD_STEPS = 20                # 总压缩位移分成多少个载荷步
 TIP_RAMP_STEPS = 50                # fixed 模式的斜坡步数；adaptive 模式中也是允许的最小增量尺度
 RAMP_MODE = "adaptive"             # adaptive=速度控制自适应加载；fixed=原程序固定平滑 ramp
 ADAPTIVE_RELAX_STEPS = 8           # 每个自适应位移增量后，最多保持末端短暂松弛的隐式步数
@@ -462,12 +468,53 @@ def _contact_single(
     return force_yz, new_integral, error, weight, z > 0.0, distance
 
 
+def _ensure_mesh_geometry(args: argparse.Namespace, device: torch.device) -> mesh_contact_v4.MeshGeometry:
+    backend = getattr(args, "mesh_backend", None)
+    if backend is None or backend.obj_file != args.mesh_obj or backend.device != device:
+        backend = mesh_contact_v4.MeshContactBackend(
+            args.mesh_obj, safe_distance=args.safe_distance, kp=args.Kp,
+            ki=args.Ki, device=device,
+        )
+        args.mesh_backend = backend
+        args.mesh_geometry = backend.geometry
+        args.mesh_contact_cache = backend._cache_for(args.num_nodes)
+        return backend.geometry
+    geometry = getattr(args, "mesh_geometry", None)
+    if geometry is None or geometry.obj_path != args.mesh_obj or geometry.triangles.device != device:
+        geometry = mesh_contact_v4.MeshGeometry.from_obj(args.mesh_obj, device=device)
+        args.mesh_geometry = geometry
+        args.mesh_contact_cache = mesh_contact_v4.MeshContactCache.for_nodes(args.num_nodes, device)
+    return geometry
+
+
+def _mesh_details(
+    positions: torch.Tensor, args: argparse.Namespace, geometry: mesh_contact_v4.MeshGeometry | None = None,
+) -> mesh_contact_v4.MeshContactDetails:
+    frozen = getattr(args, "_frozen_mesh_topology", None)
+    if frozen is not None:
+        return frozen
+    geometry = geometry or _ensure_mesh_geometry(args, positions.device)
+    return geometry.nearest(positions, getattr(args, "mesh_contact_cache", None))
+
+
 def contact_quantities(
     positions: torch.Tensor,
     integrals: torch.Tensor,
     previous_errors: torch.Tensor,
     args: argparse.Namespace,
 ):
+    if getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) == "mesh":
+        geometry = _ensure_mesh_geometry(args, positions.device)
+        details = _mesh_details(positions, args, geometry)
+        force, _blocks, state = mesh_contact_v4.fixed_face_contact(
+            positions, details, integrals, previous_errors,
+            dt=args.dt_active, kp=args.Kp, ki=args.ki_active,
+            safe_distance=args.safe_distance, max_pi_force=args.max_pi_force,
+            max_integral_state=args.max_integral_state,
+            leak_rate=args.integral_leak_rate, smooth_length=CONTACT_SMOOTH_LENGTH,
+            direction_epsilon=DIRECTION_EPSILON,
+        )
+        return force, state.new_integrals, state.active, state.weights, state.errors, state.distances
     values = torch.func.vmap(_contact_single, in_dims=(0, 0, 0, None, None, None, None, None, None, None, None))(
         positions[:, 1:], integrals, previous_errors, args.dt_active, args.tube_radius,
         args.safe_distance, args.Kp, args.ki_active, args.max_pi_force,
@@ -486,6 +533,17 @@ def assemble_contact_batched(
     pattern: AssemblyPattern,
     args: argparse.Namespace,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) == "mesh":
+        details = _mesh_details(positions, args)
+        force, blocks, _state = mesh_contact_v4.fixed_face_contact(
+            positions, details, integrals, previous_errors,
+            dt=args.dt_active, kp=args.Kp, ki=args.ki_active,
+            safe_distance=args.safe_distance, max_pi_force=args.max_pi_force,
+            max_integral_state=args.max_integral_state,
+            leak_rate=args.integral_leak_rate, smooth_length=CONTACT_SMOOTH_LENGTH,
+            direction_epsilon=DIRECTION_EPSILON,
+        )
+        return force.reshape(-1)[pattern.free_indices], blocks
     """Return the contact force on free coordinates and its per-node y/z
     Jacobian blocks (num_nodes, 2, 2), computed in a single batched pass."""
     def force_yz_aux(yz: torch.Tensor, old_i: torch.Tensor, previous: torch.Tensor):
@@ -522,6 +580,18 @@ def assemble_contact_analytic(
     matching the derivative used by PyTorch's clamp/where in the reference
     implementation away from switching-point ambiguity.
     """
+    if getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) == "mesh":
+        details = _mesh_details(positions, args)
+        force, blocks, _state = mesh_contact_v4.fixed_face_contact(
+            positions, details, integrals, previous_errors,
+            dt=args.dt_active, kp=args.Kp, ki=args.ki_active,
+            safe_distance=args.safe_distance, max_pi_force=args.max_pi_force,
+            max_integral_state=args.max_integral_state,
+            leak_rate=args.integral_leak_rate, smooth_length=CONTACT_SMOOTH_LENGTH,
+            direction_epsilon=DIRECTION_EPSILON,
+        )
+        return force.reshape(-1)[pattern.free_indices], blocks
+
     yz = positions[:, 1:]
     radial = torch.linalg.vector_norm(yz, dim=1)
     beta = 1.0 / CONTACT_SMOOTH_LENGTH
@@ -601,6 +671,13 @@ def unpack(q: torch.Tensor, free_mask: torch.Tensor, prescribed: torch.Tensor) -
 
 def compute_protection_error(positions: torch.Tensor, radius: float, safe_distance: float) -> torch.Tensor:
     return torch.clamp(torch.linalg.norm(positions[:, 1:], dim=1) - (radius - safe_distance), min=0.0)
+
+
+def compute_contact_error(positions: torch.Tensor, args: argparse.Namespace) -> torch.Tensor:
+    if getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) == "mesh":
+        details = _mesh_details(positions, args)
+        return torch.clamp(-details.clearance, min=0.0)
+    return compute_protection_error(positions, args.tube_radius, args.safe_distance)
 
 
 @dataclass(frozen=True)
@@ -834,7 +911,10 @@ def residual_and_jacobian(
         return residual, None, positions
     diagonal_add = (free_masses / args.dt_active**2 + args.damping / args.dt_active).reshape(-1, 3)
     system.diagonal.diagonal(dim1=1, dim2=2).add_(diagonal_add)
-    system.diagonal[:, 1:, 1:].add_(-contact_blocks[free_start:free_end])
+    if getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) == "mesh":
+        system.diagonal.add_(-contact_blocks[free_start:free_end])
+    else:
+        system.diagonal[:, 1:, 1:].add_(-contact_blocks[free_start:free_end])
     return residual, system, positions
 
 
@@ -863,11 +943,20 @@ def _implicit_euler_step_python(
     free_mask = ~prescribed_mask
     block_plan = get_block_assembly_plan(str(positions.device), len(positions), tip_constrained)
     previous_radius = torch.linalg.norm(positions[:, 1:], dim=1)
-    previous_errors = F.softplus(
-        previous_radius - (args.tube_radius - args.safe_distance), beta=1.0 / CONTACT_SMOOTH_LENGTH
-    )
+    if getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) == "mesh":
+        geometry = _ensure_mesh_geometry(args, positions.device)
+        with torch.no_grad():
+            _previous_force, _previous_integrals, _previous_active, _previous_weights, previous_errors, _previous_distances = contact_quantities(
+                positions, integrals, torch.zeros_like(integrals), args,
+            )
+    else:
+        previous_errors = F.softplus(
+            previous_radius - (args.tube_radius - args.safe_distance), beta=1.0 / CONTACT_SMOOTH_LENGTH
+        )
     predictor = positions + args.dt_active * velocities
     predictor[prescribed_mask] = prescribed[prescribed_mask]
+    if getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) == "mesh":
+        args._frozen_mesh_topology = _mesh_details(predictor, args)
     q = predictor[free_mask].detach()
     first_residual_started = time.perf_counter()
     current_residual, _, _ = residual_and_jacobian(
@@ -938,6 +1027,8 @@ def _implicit_euler_step_python(
     new_velocities[:2] = 0.0
     if tip_constrained:
         new_velocities[-1] = (prescribed[-1] - positions[-1]) / args.dt_active
+    if getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) == "mesh":
+        args._frozen_mesh_topology = None
     contact_started = time.perf_counter()
     with torch.no_grad():
         force, new_integrals, active, weights, errors, distances = contact_quantities(
@@ -977,6 +1068,13 @@ def _get_core(args: argparse.Namespace, rest_lengths: torch.Tensor,
             CONTACT_SMOOTH_LENGTH,
             DIRECTION_EPSILON,
         )
+        if getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) == "mesh":
+            geometry = _ensure_mesh_geometry(args, rest_lengths.device)
+            core.configure_mesh(
+                np.ascontiguousarray(geometry.triangles.detach().cpu().numpy(), dtype=np.float64),
+                np.ascontiguousarray(geometry.normals.detach().cpu().numpy(), dtype=np.float64),
+                np.ascontiguousarray(geometry.triangle_obj_ids.detach().cpu().numpy(), dtype=np.int64),
+            )
         args._cpp_core = core
     return core
 
@@ -1113,6 +1211,8 @@ def run_simulation(args: argparse.Namespace) -> dict[str, np.ndarray]:
     rest_lengths = torch.as_tensor(rest_lengths, dtype=DTYPE, device=device)
     masses = torch.as_tensor(masses, dtype=DTYPE, device=device)
     integrals = torch.as_tensor(integrals, dtype=DTYPE, device=device)
+    if getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) == "mesh":
+        _ensure_mesh_geometry(args, device)
     initial_positions = positions.detach().clone()
     args.dt_active = args.dt
     args.ki_active = args.Ki
@@ -1178,7 +1278,7 @@ def run_simulation(args: argparse.Namespace) -> dict[str, np.ndarray]:
         history["contact_active"].append(tensor_to_numpy(active).copy())
         history["contact_weight"].append(tensor_to_numpy(weights).copy())
         history["radial_distance"].append(np.linalg.norm(p_np[:, 1:], axis=1))
-        protection = compute_protection_error(positions, args.tube_radius, args.safe_distance)
+        protection = compute_contact_error(positions, args)
         history["max_protection_error"].append(float(torch.max(protection)))
         history["max_pi_force"].append(float(torch.linalg.vector_norm(force, dim=1).max()))
         history["newton_iterations"].append(info.iterations)
@@ -1236,6 +1336,8 @@ def run_simulation(args: argparse.Namespace) -> dict[str, np.ndarray]:
         cache = getattr(args, "mesh_contact_cache", None)
         if cache is None:
             return None
+        if hasattr(cache, "snapshot"):
+            return cache.snapshot()
         return (
             cache.triangle_local.clone(), cache.last_positions.clone(),
             getattr(args, "mesh_accepted_step_count", 0),
@@ -1244,12 +1346,16 @@ def run_simulation(args: argparse.Namespace) -> dict[str, np.ndarray]:
     def restore_mesh_cache(snapshot, force_uniform_refresh: bool = False) -> None:
         cache = getattr(args, "mesh_contact_cache", None)
         if cache is not None and snapshot is not None:
-            cache.triangle_local.copy_(snapshot[0])
-            cache.last_positions.copy_(snapshot[1])
-            args.mesh_accepted_step_count = snapshot[2]
+            if hasattr(cache, "restore"):
+                cache.restore(snapshot)
+            else:
+                cache.triangle_local.copy_(snapshot[0])
+                cache.last_positions.copy_(snapshot[1])
+                args.mesh_accepted_step_count = snapshot[2]
             if force_uniform_refresh:
                 cache.triangle_local.fill_(-1)
                 cache.last_positions.fill_(float("nan"))
+                cache.uniform_fallback_count = getattr(cache, "uniform_fallback_count", 0) + 1
         # Frozen/diagnostic details belong to the abandoned trial as well.
         args._frozen_mesh_topology = None
         args._last_mesh_evaluation = None
@@ -1419,7 +1525,7 @@ def run_simulation(args: argparse.Namespace) -> dict[str, np.ndarray]:
                 time_value += args.dt
                 current_max_speed = max_free_speed(velocities, prescribed_mask)
                 max_speed_seen = max(max_speed_seen, current_max_speed)
-                ramp_protection = compute_protection_error(positions, args.tube_radius, args.safe_distance)
+                ramp_protection = compute_contact_error(positions, args)
                 max_contact_error_seen = max(max_contact_error_seen, float(torch.max(ramp_protection)))
                 if ramp % DIAGNOSTIC_INTERVAL == 0 or ramp == args.tip_ramp_steps:
                     print(
@@ -1531,7 +1637,7 @@ def run_simulation(args: argparse.Namespace) -> dict[str, np.ndarray]:
                 adaptive_increment_sum += proposed_increment
                 time_value += args.dt * (1 + micro_steps)
                 max_speed_seen = max(max_speed_seen, current_max_speed)
-                ramp_protection = compute_protection_error(positions, args.tube_radius, args.safe_distance)
+                ramp_protection = compute_contact_error(positions, args)
                 max_contact_error_seen = max(max_contact_error_seen, float(torch.max(ramp_protection)))
                 print(
                     f"[ADAPT {load_step:02d}/{args.num_load_steps:02d} | {internal_step:3d}] "
@@ -1597,7 +1703,7 @@ def run_simulation(args: argparse.Namespace) -> dict[str, np.ndarray]:
                     f"{subdivisions} local substeps, Ki_eff={effective_ki:g}",
                     flush=True,
                 )
-            protection = compute_protection_error(positions, args.tube_radius, args.safe_distance)
+            protection = compute_contact_error(positions, args)
             max_speed = max_free_speed(velocities, prescribed_mask)
             max_contact_error = float(torch.max(protection))
             max_pi_force = float(torch.linalg.vector_norm(last_force, dim=1).max())
@@ -2117,6 +2223,8 @@ def self_test(args: argparse.Namespace) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backend", choices=("cpp", "python"), default=BACKEND_DEFAULT)
+    parser.add_argument("--contact-type", choices=("tube", "mesh"), default=CONTACT_TYPE_DEFAULT)
+    parser.add_argument("--mesh-obj", type=Path, default=MESH_OBJ_DEFAULT)
     parser.add_argument("--total-length", type=float, default=TOTAL_LENGTH)
     parser.add_argument("--diameter", type=float, default=DIAMETER)
     parser.add_argument("--density", type=float, default=MATERIAL_DENSITY)
@@ -2233,6 +2341,9 @@ def parse_args() -> argparse.Namespace:
         parser.error("pulse-force-max must be greater than or equal to pulse-force-min")
     args.ki_active = args.Ki
     args.torch_device = resolve_device(args.device)
+    args.mesh_obj = args.mesh_obj.expanduser().resolve()
+    if args.contact_type == "mesh" and not args.mesh_obj.is_file():
+        parser.error(f"mesh OBJ does not exist: {args.mesh_obj}")
     if args.backend == "cpp" and args.device == "auto":
         args.torch_device = torch.device("cpu")
     elif args.backend == "cpp" and args.torch_device.type == "cuda":

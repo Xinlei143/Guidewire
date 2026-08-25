@@ -6,6 +6,7 @@
 #include <pybind11/pybind11.h>
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -31,6 +32,8 @@ class DERCore {
                           const py::array& integrals,
                           const py::array& previous_errors, double dt,
                           double ki_active) const;
+  void configure_mesh(const py::array& triangles, const py::array& normals,
+                      const py::array& triangle_ids);
   double nominal_ki() const { return ki_; }
   py::dict implicit_euler_step(
       const py::array& positions, const py::array& velocities,
@@ -62,6 +65,11 @@ class DERCore {
   double max_integral_state_;
   double contact_smooth_length_;
   double direction_epsilon_;
+  bool mesh_enabled_ = false;
+  std::vector<Vec3> mesh_triangles_;
+  std::vector<Vec3> mesh_normals_;
+  std::vector<std::int64_t> mesh_triangle_ids_;
+  mutable std::vector<int> mesh_frozen_faces_;
 };
 
 }  // namespace der

@@ -113,6 +113,18 @@ class DERCore:
             float(ki_active),
         )
 
+    def configure_mesh(self, triangles, normals, triangle_ids):
+        tri = np.asarray(triangles)
+        nor = np.asarray(normals)
+        ids = np.asarray(triangle_ids)
+        if tri.dtype != np.float64 or nor.dtype != np.float64:
+            raise TypeError("triangles and normals must have dtype float64")
+        if ids.dtype != np.int64:
+            raise TypeError("triangle_ids must have dtype int64")
+        if not tri.flags.c_contiguous or not nor.flags.c_contiguous or not ids.flags.c_contiguous:
+            raise ValueError("mesh geometry arrays must be C-contiguous")
+        self._impl.configure_mesh(tri, nor, ids)
+
     def implicit_euler_step(self, positions, velocities, *args):
         """Run one step using either the legacy or cached production signature.
 

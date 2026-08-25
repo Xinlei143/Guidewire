@@ -21,6 +21,10 @@ __pycache__/
 *.synctex.gz
 *.toc
 *.xdv
+.agents
+.codex
+.vscode
+
 
 .vscode
 3d_npz

@@ -47,7 +47,7 @@ CONTACT_SMOOTH_LENGTH = 2e-5       # 接触开启的平滑长度；越大接触�
 DIRECTION_EPSILON = 1e-6           # 节点在管轴上时用于避免径向单位向量除零
 
 # --- 准静态求解与平衡判据 ---
-DT = 0.1                          # 隐式 Euler 单步时间；仅用于脉冲/松弛，不代表真实加载时间
+DT = 0.005                          # 隐式 Euler 单步时间；仅用于脉冲/松弛，不代表真实加载时间
 MAX_NEWTON_ITERS = 200             # 每个隐式步允许的 Newton 最大迭代次数
 NEWTON_RESIDUAL_TOL = 1e-7         # 单个 Newton 步的力残差收敛阈值
 NEWTON_STEP_TOL = 1e-10            # Newton 位移修正很小时的停止阈值

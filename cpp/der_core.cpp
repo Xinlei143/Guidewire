@@ -311,6 +311,120 @@ struct ContactValue {
   double distance = 0.0;
 };
 
+struct MeshContactValue {
+  ContactValue value;
+  std::int64_t triangle_id = -1;
+};
+
+Vec3 closest_point_triangle(const Vec3& p, const Vec3& a, const Vec3& b,
+                            const Vec3& c) {
+  const Vec3 ab = b - a;
+  const Vec3 ac = c - a;
+  const Vec3 ap = p - a;
+  const double d1 = ab.dot(ap), d2 = ac.dot(ap);
+  if (d1 <= 0.0 && d2 <= 0.0) return a;
+  const Vec3 bp = p - b;
+  const double d3 = ab.dot(bp), d4 = ac.dot(bp);
+  if (d3 >= 0.0 && d4 <= d3) return b;
+  const double vc = d1 * d4 - d3 * d2;
+  if (vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0)
+    return a + (d1 / std::max(d1 - d3, 1.0e-30)) * ab;
+  const Vec3 cp = p - c;
+  const double d5 = ab.dot(cp), d6 = ac.dot(cp);
+  if (d6 >= 0.0 && d5 <= d6) return c;
+  const double vb = d5 * d2 - d1 * d6;
+  if (vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0)
+    return a + (d2 / std::max(d2 - d6, 1.0e-30)) * ac;
+  const double va = d3 * d6 - d5 * d4;
+  if (va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0)
+    return b + ((d4 - d3) / std::max((d4 - d3) + (d5 - d6), 1.0e-30)) * (c - b);
+  const double denom = std::max(va + vb + vc, 1.0e-30);
+  return a + (vb / denom) * ab + (vc / denom) * ac;
+}
+
+int nearest_mesh_face(const Vec3& point, const std::vector<Vec3>& triangles) {
+  double best_distance2 = std::numeric_limits<double>::infinity();
+  int best = -1;
+  for (int face = 0; face < static_cast<int>(triangles.size() / 3); ++face) {
+    const Vec3 closest = closest_point_triangle(
+        point, triangles[3 * face], triangles[3 * face + 1], triangles[3 * face + 2]);
+    const double distance2 = (point - closest).squaredNorm();
+    if (distance2 < best_distance2) {
+      best_distance2 = distance2;
+      best = face;
+    }
+  }
+  return best;
+}
+
+MeshContactValue evaluate_mesh_contact(
+    const Vec3& point, double old_integral, double previous_error, double dt,
+    double kp, double ki_active, double max_pi_force, double leak_rate,
+    double max_integral_state, double smooth_length,
+    const std::vector<Vec3>& triangles, const std::vector<Vec3>& normals,
+    const std::vector<std::int64_t>& triangle_ids, int fixed_face = -1) {
+  MeshContactValue output;
+  if (triangles.empty()) return output;
+  double best_distance2 = std::numeric_limits<double>::infinity();
+  int best = -1;
+  Vec3 best_point = Vec3::Zero();
+  const int first_face = fixed_face >= 0 ? fixed_face : 0;
+  const int last_face = fixed_face >= 0 ? fixed_face + 1 : static_cast<int>(normals.size());
+  for (int face = first_face; face < last_face; ++face) {
+    const Vec3 closest = closest_point_triangle(
+        point, triangles[3 * face], triangles[3 * face + 1], triangles[3 * face + 2]);
+    const double distance2 = (point - closest).squaredNorm();
+    if (distance2 < best_distance2) {
+      best_distance2 = distance2;
+      best = face;
+      best_point = closest;
+    }
+  }
+  if (best < 0) return output;
+  const Vec3 normal = normals[best];
+  const double clearance = normal.dot(point - triangles[3 * best]);
+  const double signed_penetration = -clearance;
+  const bool active = signed_penetration > 0.0;
+  const double beta = 1.0 / smooth_length;
+  const double shifted = softplus(signed_penetration, beta) - std::log(2.0) / beta;
+  const double error = active ? shifted : 0.0;
+  const double error_prime = active ? sigmoid(beta * signed_penetration) : 0.0;
+  const double penetration = std::max(signed_penetration, 0.0);
+  const double activation = active ? -std::expm1(-penetration / smooth_length) : 0.0;
+  const double activation_prime = active ? std::exp(-penetration / smooth_length) / smooth_length : 0.0;
+  const double decay = std::exp(-leak_rate * dt);
+  const double accumulated = old_integral + error * dt;
+  const double leaked = old_integral * decay;
+  const double candidate_raw = activation * accumulated + (1.0 - activation) * leaked;
+  const double candidate = std::min(std::max(candidate_raw, 0.0), max_integral_state);
+  const bool candidate_inside = candidate_raw >= 0.0 && candidate_raw <= max_integral_state;
+  const double candidate_prime_raw = activation_prime * (accumulated - leaked) + activation * error_prime * dt;
+  const double candidate_prime = candidate_inside ? candidate_prime_raw : 0.0;
+  const double unsaturated = kp * error + ki_active * candidate;
+  const bool stop_growth =
+      (ki_active > 0.0 && unsaturated >= max_pi_force && candidate > old_integral) ||
+      (ki_active > 0.0 && error < previous_error && ki_active * old_integral > kp * error && candidate > old_integral);
+  const double integral = stop_growth ? old_integral : candidate;
+  const double integral_prime = stop_growth ? 0.0 : candidate_prime;
+  const double raw_force = kp * error + ki_active * integral;
+  const double clamped_force = std::min(std::max(raw_force, 0.0), max_pi_force);
+  const bool force_inside = raw_force >= 0.0 && raw_force <= max_pi_force;
+  const double raw_prime = kp * error_prime + ki_active * integral_prime;
+  const double magnitude_prime = activation_prime * clamped_force +
+      activation * (force_inside ? raw_prime : 0.0);
+  output.value.force = Vec3::Zero();
+  if (active) output.value.force = normal * (activation * clamped_force);
+  output.value.jacobian = -magnitude_prime * (normal * normal.transpose());
+  output.value.new_integral = integral;
+  output.value.error = error;
+  output.value.weight = activation;
+  output.value.active = active;
+  output.value.distance = clearance;
+  output.triangle_id = triangle_ids[best];
+  (void)best_point;
+  return output;
+}
+
 struct BlockPentaSystem {
   explicit BlockPentaSystem(int count)
       : diagonal(count, Mat3::Zero()),
@@ -467,6 +581,51 @@ DERCore::DERCore(const py::array& rest_lengths, const py::array& masses,
   }
 }
 
+void DERCore::configure_mesh(const py::array& triangles, const py::array& normals,
+                             const py::array& triangle_ids) {
+  const auto tri = triangles.request();
+  const auto nor = normals.request();
+  py::array_t<std::int64_t, py::array::c_style | py::array::forcecast> ids_array(triangle_ids);
+  const auto ids = ids_array.request();
+  if (tri.ndim != 3 || tri.shape[1] != 3 || tri.shape[2] != 3 ||
+      tri.format != py::format_descriptor<double>::format() ||
+      tri.itemsize != static_cast<ssize_t>(sizeof(double)) ||
+      !(triangles.flags() & py::array::c_style)) {
+    throw py::type_error("triangles must be a contiguous float64 array of shape (M,3,3)");
+  }
+  if (nor.ndim != 2 || nor.shape[0] != tri.shape[0] || nor.shape[1] != 3 ||
+      nor.format != py::format_descriptor<double>::format() ||
+      nor.itemsize != static_cast<ssize_t>(sizeof(double)) ||
+      !(normals.flags() & py::array::c_style)) {
+    throw py::type_error("normals must be a contiguous float64 array of shape (M,3)");
+  }
+  if (ids.ndim != 1 || ids.shape[0] != tri.shape[0]) {
+    throw py::type_error("triangle_ids must be an int64 array of shape (M,)");
+  }
+  const auto* tri_ptr = static_cast<const double*>(tri.ptr);
+  const auto* nor_ptr = static_cast<const double*>(nor.ptr);
+  const auto* id_ptr = static_cast<const std::int64_t*>(ids.ptr);
+  mesh_triangles_.resize(static_cast<std::size_t>(tri.shape[0]) * 3);
+  mesh_normals_.resize(static_cast<std::size_t>(tri.shape[0]));
+  mesh_triangle_ids_.resize(static_cast<std::size_t>(tri.shape[0]));
+  for (ssize_t face = 0; face < tri.shape[0]; ++face) {
+    for (int vertex = 0; vertex < 3; ++vertex) {
+      mesh_triangles_[3 * face + vertex] = Vec3(
+          tri_ptr[face * 9 + vertex * 3], tri_ptr[face * 9 + vertex * 3 + 1],
+          tri_ptr[face * 9 + vertex * 3 + 2]);
+      if (!mesh_triangles_[3 * face + vertex].allFinite())
+        throw py::value_error("triangles must contain only finite values");
+    }
+    mesh_normals_[face] = Vec3(nor_ptr[face * 3], nor_ptr[face * 3 + 1], nor_ptr[face * 3 + 2]);
+    const double normal_length = mesh_normals_[face].norm();
+    if (!std::isfinite(normal_length) || normal_length < 1.0e-12)
+      throw py::value_error("normals must be finite and non-degenerate");
+    mesh_normals_[face] /= normal_length;
+    mesh_triangle_ids_[face] = id_ptr[face];
+  }
+  mesh_enabled_ = !mesh_normals_.empty();
+}
+
 py::tuple DERCore::stretch_kernel(const py::array& positions,
                                   const py::array& rest_lengths) const {
   const auto p = checked_array(positions, "positions", 2);
@@ -549,6 +708,50 @@ py::dict DERCore::contact_kernel(const py::array& positions,
   const auto* x = static_cast<const double*>(p.ptr);
   const auto* oi = static_cast<const double*>(old_i.ptr);
   const auto* pe = static_cast<const double*>(previous.ptr);
+  if (mesh_enabled_) {
+    py::array_t<double> force(py::array::ShapeContainer(
+        std::vector<py::ssize_t>{nodes, 3}));
+    py::array_t<double> jacobian(py::array::ShapeContainer(
+        std::vector<py::ssize_t>{nodes, 3, 3}));
+    py::array_t<double> new_integrals(nodes), errors(nodes), weights(nodes), distances(nodes);
+    py::array_t<bool> active(nodes);
+    py::array_t<std::int64_t> triangle_ids(nodes);
+    auto* f = static_cast<double*>(force.request().ptr);
+    auto* j = static_cast<double*>(jacobian.request().ptr);
+    auto* ni = static_cast<double*>(new_integrals.request().ptr);
+    auto* er = static_cast<double*>(errors.request().ptr);
+    auto* we = static_cast<double*>(weights.request().ptr);
+    auto* ac = static_cast<bool*>(active.request().ptr);
+    auto* di = static_cast<double*>(distances.request().ptr);
+    auto* ti = static_cast<std::int64_t*>(triangle_ids.request().ptr);
+    for (ssize_t n = 0; n < nodes; ++n) {
+      const MeshContactValue value = evaluate_mesh_contact(
+          Vec3(x[3 * n], x[3 * n + 1], x[3 * n + 2]), oi[n], pe[n], dt,
+          kp_, ki_active, max_pi_force_, leak_rate_, max_integral_state_,
+          contact_smooth_length_, mesh_triangles_, mesh_normals_, mesh_triangle_ids_);
+      for (int k = 0; k < 3; ++k) {
+        f[3 * n + k] = value.value.force(k);
+        for (int l = 0; l < 3; ++l) j[9 * n + 3 * k + l] = value.value.jacobian(k, l);
+      }
+      ni[n] = value.value.new_integral;
+      er[n] = value.value.error;
+      we[n] = value.value.weight;
+      ac[n] = value.value.active;
+      di[n] = value.value.distance;
+      ti[n] = value.triangle_id;
+    }
+    py::dict result;
+    result["force"] = force;
+    result["jacobian"] = jacobian;
+    result["new_integrals"] = new_integrals;
+    result["errors"] = errors;
+    result["weights"] = weights;
+    result["active"] = active;
+    result["distances"] = distances;
+    result["triangle_ids"] = triangle_ids;
+    result["mesh_triangle_ids"] = triangle_ids;
+    return result;
+  }
   py::array_t<double> force(py::array::ShapeContainer(
       std::vector<py::ssize_t>{nodes, 3}));
   py::array_t<double> jacobian(py::array::ShapeContainer(
@@ -680,10 +883,28 @@ py::dict DERCore::implicit_euler_step(
     }
   }
 
+  mesh_frozen_faces_.assign(static_cast<std::size_t>(nodes), -1);
+  if (mesh_enabled_) {
+    for (int n = 0; n < nodes; ++n) {
+      Vec3 predictor = prescribed.segment<3>(3 * n);
+      if (n >= first_free && n < last_free)
+        predictor = q.segment<3>(3 * (n - first_free));
+      mesh_frozen_faces_[n] = nearest_mesh_face(predictor, mesh_triangles_);
+    }
+  }
+
   Eigen::VectorXd previous_error(nodes);
   for (int n = 0; n < nodes; ++n) {
-    const double radial = std::hypot(old_full(3 * n + 1), old_full(3 * n + 2));
-    previous_error(n) = softplus(radial - (tube_radius_ - safe_distance_), beta);
+    if (mesh_enabled_) {
+      const MeshContactValue value = evaluate_mesh_contact(
+          old_full.segment<3>(3 * n), old_integral[n], 0.0, dt, kp_, ki_active,
+          max_pi_force_, leak_rate_, max_integral_state_, contact_smooth_length_,
+          mesh_triangles_, mesh_normals_, mesh_triangle_ids_);
+      previous_error(n) = value.value.error;
+    } else {
+      const double radial = std::hypot(old_full(3 * n + 1), old_full(3 * n + 2));
+      previous_error(n) = softplus(radial - (tube_radius_ - safe_distance_), beta);
+    }
   }
   // All subsequent work until the output buffers are created is pure Eigen/
   // STL arithmetic.  Let other Python threads run while Newton is active.
@@ -764,6 +985,16 @@ py::dict DERCore::implicit_euler_step(
     std::vector<Mat3> contact_jac(nodes, Mat3::Zero());
     const double decay = std::exp(-leak_rate_ * dt);
     for (int n = 0; n < nodes; ++n) {
+      if (mesh_enabled_) {
+        const MeshContactValue value = evaluate_mesh_contact(
+            full.segment<3>(3 * n), old_integral[n], previous_error(n), dt, kp_,
+            ki_active, max_pi_force_, leak_rate_, max_integral_state_,
+            contact_smooth_length_, mesh_triangles_, mesh_normals_, mesh_triangle_ids_,
+            mesh_frozen_faces_[n]);
+        contact_force.segment<3>(3 * n) = value.value.force;
+        if (with_jacobian) contact_jac[n] = value.value.jacobian;
+        continue;
+      }
       const double y = full(3 * n + 1), z = full(3 * n + 2);
       const double radial = std::hypot(y, z);
       const double protection = radial - (tube_radius_ - safe_distance_);
