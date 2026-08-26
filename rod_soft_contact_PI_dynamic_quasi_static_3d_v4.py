@@ -41,7 +41,7 @@ DIAMETER = 0.001                   # 导丝直径，影响横截面积、质量�
 MATERIAL_DENSITY = 7850.0          # 材料密度，kg/m^3
 YOUNG_MODULUS = 200.0e9            # 杨氏模量，越大表示导丝越不容易拉伸和弯曲
 DAMPING_RATIO = 1.0                # 阻尼比例；增大可更快消除振动，但过大可能使收敛变慢
-NUM_NODES = 500                    # 导丝节点数；越大越精细，但计算量也显著增加
+NUM_NODES = 250                    # 导丝节点数；越大越精细，但计算量也显著增加
 
 # --- 直圆管与 PI 软接触 ---
 TUBE_RADIUS = 60e-3                # 直管内半径；管轴为 x 轴
@@ -55,7 +55,7 @@ CONTACT_SMOOTH_LENGTH = 2e-5       # 接触开启的平滑长度；越大接触�
 DIRECTION_EPSILON = 1e-6           # 节点在管轴上时用于避免径向单位向量除零
 
 # --- 准静态求解与平衡判据 ---
-DT = 0.005                          # 隐式 Euler 单步时间；仅用于脉冲/松弛，不代表真实加载时间
+DT = 0.05                          # 隐式 Euler 单步时间；仅用于脉冲/松弛，不代表真实加载时间
 MAX_NEWTON_ITERS = 200             # 每个隐式步允许的 Newton 最大迭代次数
 NEWTON_RESIDUAL_TOL = 1e-7         # 单个 Newton 步的力残差收敛阈值
 NEWTON_STEP_TOL = 1e-10            # Newton 位移修正很小时的停止阈值
@@ -1985,16 +1985,195 @@ def resolve_output_paths(
     return run_stem, npz_path, picture_path, summary_path
 
 
+def _analytic_tube_surface(
+    total_length: float, tube_radius: float, *, axial_samples: int,
+    circumferential_samples: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return the legacy straight-cylinder surface at a chosen resolution."""
+    x = np.linspace(0.0, total_length, axial_samples + 1)
+    theta = np.linspace(0.0, 2.0 * np.pi, circumferential_samples + 1)
+    X, THETA = np.meshgrid(x, theta)
+    Y = tube_radius * np.cos(THETA)
+    Z = tube_radius * np.sin(THETA)
+    return X, Y, Z
+
+
+def _mesh_visualization_surface(
+    geometry: mesh_contact_v4.MeshGeometry, *, axial_samples: int,
+    circumferential_samples: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build a small swept-tube proxy from the imported protection geometry.
+
+    The full triangle mesh remains owned by the contact solver.  This helper
+    only estimates ordered ring centres/radii and reconstructs a low-resolution
+    surface for Matplotlib, so rendering cost is independent of the OBJ face
+    count.  ``MeshGeometry.vertices`` includes the optional outer shell; when it
+    is present, the high radial percentile keeps the displayed shell thickness.
+    """
+    triangles = geometry.triangles.detach().cpu().numpy()
+    all_vertices = geometry.vertices.detach().cpu().numpy()
+    if triangles.ndim != 3 or triangles.shape[1:] != (3, 3):
+        raise ValueError("mesh visualization requires triangular geometry")
+    protection_points = triangles.reshape(-1, 3)
+    if len(protection_points) < 6 or not np.isfinite(protection_points).all():
+        raise ValueError("mesh visualization requires finite protection vertices")
+    if all_vertices.ndim != 2 or all_vertices.shape[1] != 3:
+        all_vertices = protection_points
+    all_vertices = np.asarray(all_vertices, dtype=np.float64)
+    if not np.isfinite(all_vertices).all():
+        all_vertices = protection_points
+
+    origin = protection_points.mean(axis=0)
+    covariance = np.cov(protection_points - origin, rowvar=False)
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+    longitudinal = np.asarray(eigenvectors[:, int(np.argmax(eigenvalues))], dtype=np.float64)
+    longitudinal_norm = np.linalg.norm(longitudinal)
+    if not np.isfinite(longitudinal_norm) or longitudinal_norm < 1.0e-12:
+        raise ValueError("could not estimate mesh longitudinal axis")
+    longitudinal /= longitudinal_norm
+
+    protection_centroids = triangles.mean(axis=1)
+    centroid_projection = (protection_centroids - origin) @ longitudinal
+    vertex_projection = (all_vertices - origin) @ longitudinal
+    projection_min = float(np.min(centroid_projection))
+    projection_max = float(np.max(centroid_projection))
+    projection_span = projection_max - projection_min
+    if not np.isfinite(projection_span) or projection_span < 1.0e-10:
+        raise ValueError("mesh has no resolvable longitudinal extent")
+
+    target_projections = np.linspace(projection_min, projection_max, axial_samples + 1)
+    bin_boundaries = 0.5 * (target_projections[:-1] + target_projections[1:])
+    centres = np.full((axial_samples + 1, 3), np.nan, dtype=np.float64)
+    radii = np.full(axial_samples + 1, np.nan, dtype=np.float64)
+    for index in range(axial_samples + 1):
+        lower = -np.inf if index == 0 else bin_boundaries[index - 1]
+        upper = np.inf if index == axial_samples else bin_boundaries[index]
+        protection_mask = (centroid_projection >= lower) & (centroid_projection < upper)
+        vertex_mask = (vertex_projection >= lower) & (vertex_projection < upper)
+        if not np.any(protection_mask):
+            continue
+        local_protection = triangles[protection_mask].reshape(-1, 3)
+        centres[index] = local_protection.mean(axis=0)
+        local_vertices = all_vertices[vertex_mask]
+        if len(local_vertices) == 0:
+            local_vertices = local_protection
+        offsets = local_vertices - centres[index]
+        offsets -= np.outer(offsets @ longitudinal, longitudinal)
+        distances = np.linalg.norm(offsets, axis=1)
+        finite_distances = distances[np.isfinite(distances) & (distances > 1.0e-12)]
+        if len(finite_distances):
+            # Inner and outer shell vertices are both present in the shipped
+            # OBJ; the high percentile selects the visible outer envelope.
+            radii[index] = float(np.percentile(finite_distances, 85.0))
+
+    valid = np.isfinite(radii) & (radii > 1.0e-12) & np.isfinite(centres).all(axis=1)
+    if int(valid.sum()) < 2:
+        raise ValueError("mesh does not provide enough axial samples")
+    valid_indices = np.flatnonzero(valid)
+    sample_indices = np.arange(axial_samples + 1)
+    for component in range(3):
+        centres[:, component] = np.interp(
+            sample_indices, valid_indices, centres[valid, component],
+        )
+    radii = np.interp(sample_indices, valid_indices, radii[valid])
+
+    tangents = np.empty_like(centres)
+    tangents[0] = centres[1] - centres[0]
+    tangents[-1] = centres[-1] - centres[-2]
+    if len(centres) > 2:
+        tangents[1:-1] = centres[2:] - centres[:-2]
+    tangent_norms = np.linalg.norm(tangents, axis=1)
+    if np.any(~np.isfinite(tangent_norms)) or np.any(tangent_norms < 1.0e-12):
+        raise ValueError("mesh centreline is not sufficiently resolved")
+    tangents /= tangent_norms[:, None]
+    tangents *= np.where((tangents @ longitudinal)[:, None] >= 0.0, 1.0, -1.0)
+
+    rings = np.empty((axial_samples + 1, circumferential_samples + 1, 3), dtype=np.float64)
+    theta = np.linspace(0.0, 2.0 * np.pi, circumferential_samples + 1)
+    for index, tangent in enumerate(tangents):
+        reference = np.array([0.0, 0.0, 1.0])
+        if abs(float(tangent @ reference)) > 0.9:
+            reference = np.array([0.0, 1.0, 0.0])
+        normal_a = reference - tangent * float(tangent @ reference)
+        normal_a /= np.linalg.norm(normal_a)
+        normal_b = np.cross(tangent, normal_a)
+        normal_b /= np.linalg.norm(normal_b)
+        rings[index] = centres[index] + radii[index] * (
+            np.cos(theta)[:, None] * normal_a + np.sin(theta)[:, None] * normal_b
+        )
+    return rings[:, :, 0].T, rings[:, :, 1].T, rings[:, :, 2].T
+
+
+def _visualization_surface(
+    args: argparse.Namespace, *, axial_samples: int,
+    circumferential_samples: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return a cached low-cost mesh surface or the legacy cylinder fallback."""
+    geometry = getattr(args, "mesh_geometry", None)
+    cache_key = (
+        id(geometry), getattr(args, "contact_type", CONTACT_TYPE_DEFAULT),
+        int(axial_samples), int(circumferential_samples),
+    )
+    cached = getattr(args, "_visualization_surface_cache", None)
+    if cached is not None and cached[0] == cache_key:
+        return cached[1]
+    if getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) == "mesh" and geometry is not None:
+        try:
+            surface = _mesh_visualization_surface(
+                geometry, axial_samples=axial_samples,
+                circumferential_samples=circumferential_samples,
+            )
+        except (TypeError, ValueError, RuntimeError):
+            surface = _analytic_tube_surface(
+                args.total_length, args.tube_radius,
+                axial_samples=axial_samples,
+                circumferential_samples=circumferential_samples,
+            )
+    else:
+        surface = _analytic_tube_surface(
+            args.total_length, args.tube_radius,
+            axial_samples=axial_samples,
+            circumferential_samples=circumferential_samples,
+        )
+    args._visualization_surface_cache = (cache_key, surface)
+    return surface
+
+
+def _set_visualization_bounds(
+    ax, positions: np.ndarray, surface: tuple[np.ndarray, np.ndarray, np.ndarray],
+    args: argparse.Namespace,
+) -> None:
+    """Use proxy-and-rod bounds for mesh mode, preserving tube-mode framing."""
+    if getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) != "mesh":
+        ax.set_xlim(0.0, args.total_length)
+        ax.set_ylim(-1.15 * args.tube_radius, 1.15 * args.tube_radius)
+        ax.set_zlim(-1.15 * args.tube_radius, 1.15 * args.tube_radius)
+        ax.set_box_aspect((args.total_length, 6 * args.tube_radius, 6 * args.tube_radius))
+        return
+    coordinates = np.concatenate((
+        np.asarray(positions, dtype=np.float64).reshape(-1, 3),
+        np.column_stack([surface[0].ravel(), surface[1].ravel(), surface[2].ravel()]),
+    ), axis=0)
+    lower = coordinates.min(axis=0)
+    upper = coordinates.max(axis=0)
+    span = np.maximum(upper - lower, 1.0e-3)
+    padding = 0.06 * span
+    lower -= padding
+    upper += padding
+    ax.set_xlim(lower[0], upper[0])
+    ax.set_ylim(lower[1], upper[1])
+    ax.set_zlim(lower[2], upper[2])
+    ax.set_box_aspect(upper - lower)
+
+
 def create_final_result_figure(history: dict[str, np.ndarray], args: argparse.Namespace):
     """Build the report-ready final PNG: deformation, random loads and energies."""
     import matplotlib.pyplot as plt
     from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
     positions = history["positions"]
-    x = np.linspace(0.0, args.total_length, 48)
-    theta = np.linspace(0.0, 2.0 * np.pi, 36)
-    X, THETA = np.meshgrid(x, theta)
-    Y, Z = args.tube_radius * np.cos(THETA), args.tube_radius * np.sin(THETA)
+    surface = _visualization_surface(args, axial_samples=24, circumferential_samples=16)
+    X, Y, Z = surface
     fig = plt.figure(figsize=(16, 10), dpi=180)
 
     ax = fig.add_axes([0.02, 0.37, 0.96, 0.60], projection="3d")
@@ -2006,12 +2185,11 @@ def create_final_result_figure(history: dict[str, np.ndarray], args: argparse.Na
         ax.scatter(*positions[-1, active].T, c="magenta", s=18, label="final contact")
     ax.set(
         xlabel="x (m)", ylabel="y (m)", zlabel="z (m)",
-        title="Final guidewire deformation in the straight cylindrical tube",
+        title=("Final guidewire deformation in the imported mesh (simplified display)"
+               if getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) == "mesh"
+               else "Final guidewire deformation in the straight cylindrical tube"),
     )
-    ax.set_xlim(0.0, args.total_length)
-    ax.set_ylim(-1.15 * args.tube_radius, 1.15 * args.tube_radius)
-    ax.set_zlim(-1.15 * args.tube_radius, 1.15 * args.tube_radius)
-    ax.set_box_aspect((args.total_length, 6 * args.tube_radius, 6 * args.tube_radius))
+    _set_visualization_bounds(ax, positions, surface, args)
     ax.view_init(elev=18, azim=-64)
     ax.legend(loc="upper right")
 
@@ -2095,10 +2273,8 @@ def visualize_results(history: dict[str, np.ndarray], args: argparse.Namespace) 
     from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
     positions = history["positions"]
-    x = np.linspace(0.0, args.total_length, 40)
-    theta = np.linspace(0.0, 2.0 * np.pi, 32)
-    X, THETA = np.meshgrid(x, theta)
-    Y, Z = args.tube_radius * np.cos(THETA), args.tube_radius * np.sin(THETA)
+    surface = _visualization_surface(args, axial_samples=16, circumferential_samples=12)
+    X, Y, Z = surface
     if not args.skip_animation:
         # 直管沿 x 方向很长，采用横向窗口可去掉上下无效白边，
         # 同时保持导丝在窗口中的实际显示宽度。
@@ -2114,10 +2290,7 @@ def visualize_results(history: dict[str, np.ndarray], args: argparse.Namespace) 
             xlabel="x (m)", ylabel="y (m)", zlabel="z (m)",
             title="3-D guidewire compression animation",
         )
-        ax_animation.set_xlim(0.0, args.total_length)
-        ax_animation.set_ylim(-1.15 * args.tube_radius, 1.15 * args.tube_radius)
-        ax_animation.set_zlim(-1.15 * args.tube_radius, 1.15 * args.tube_radius)
-        ax_animation.set_box_aspect((args.total_length, 6 * args.tube_radius, 6 * args.tube_radius))
+        _set_visualization_bounds(ax_animation, positions, surface, args)
         ax_animation.view_init(elev=18, azim=-64)
         ax_animation.legend(loc="upper right")
         frame_indices = np.arange(0, len(positions), max(1, args.animation_stride))
