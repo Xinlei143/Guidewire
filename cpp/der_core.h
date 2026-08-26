@@ -1,5 +1,7 @@
 #pragma once
 
+#include "mesh_bvh.h"
+
 #include <Eigen/Core>
 #include <Eigen/LU>
 #include <pybind11/numpy.h>
@@ -69,7 +71,7 @@ class DERCore {
   std::vector<Vec3> mesh_triangles_;
   std::vector<Vec3> mesh_normals_;
   std::vector<std::int64_t> mesh_triangle_ids_;
-  mutable std::vector<int> mesh_frozen_faces_;
+  MeshBVH mesh_bvh_;
 };
 
 }  // namespace der

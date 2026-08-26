@@ -1,4 +1,5 @@
 #include "der_core.h"
+#include "der_bending.h"
 
 #include <chrono>
 #include <algorithm>
@@ -316,45 +317,8 @@ struct MeshContactValue {
   std::int64_t triangle_id = -1;
 };
 
-Vec3 closest_point_triangle(const Vec3& p, const Vec3& a, const Vec3& b,
-                            const Vec3& c) {
-  const Vec3 ab = b - a;
-  const Vec3 ac = c - a;
-  const Vec3 ap = p - a;
-  const double d1 = ab.dot(ap), d2 = ac.dot(ap);
-  if (d1 <= 0.0 && d2 <= 0.0) return a;
-  const Vec3 bp = p - b;
-  const double d3 = ab.dot(bp), d4 = ac.dot(bp);
-  if (d3 >= 0.0 && d4 <= d3) return b;
-  const double vc = d1 * d4 - d3 * d2;
-  if (vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0)
-    return a + (d1 / std::max(d1 - d3, 1.0e-30)) * ab;
-  const Vec3 cp = p - c;
-  const double d5 = ab.dot(cp), d6 = ac.dot(cp);
-  if (d6 >= 0.0 && d5 <= d6) return c;
-  const double vb = d5 * d2 - d1 * d6;
-  if (vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0)
-    return a + (d2 / std::max(d2 - d6, 1.0e-30)) * ac;
-  const double va = d3 * d6 - d5 * d4;
-  if (va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0)
-    return b + ((d4 - d3) / std::max((d4 - d3) + (d5 - d6), 1.0e-30)) * (c - b);
-  const double denom = std::max(va + vb + vc, 1.0e-30);
-  return a + (vb / denom) * ab + (vc / denom) * ac;
-}
-
-int nearest_mesh_face(const Vec3& point, const std::vector<Vec3>& triangles) {
-  double best_distance2 = std::numeric_limits<double>::infinity();
-  int best = -1;
-  for (int face = 0; face < static_cast<int>(triangles.size() / 3); ++face) {
-    const Vec3 closest = closest_point_triangle(
-        point, triangles[3 * face], triangles[3 * face + 1], triangles[3 * face + 2]);
-    const double distance2 = (point - closest).squaredNorm();
-    if (distance2 < best_distance2) {
-      best_distance2 = distance2;
-      best = face;
-    }
-  }
-  return best;
+int nearest_mesh_face(const Vec3& point, const MeshBVH& mesh_bvh) {
+  return mesh_bvh.nearest_face(point);
 }
 
 MeshContactValue evaluate_mesh_contact(
@@ -362,24 +326,13 @@ MeshContactValue evaluate_mesh_contact(
     double kp, double ki_active, double max_pi_force, double leak_rate,
     double max_integral_state, double smooth_length,
     const std::vector<Vec3>& triangles, const std::vector<Vec3>& normals,
-    const std::vector<std::int64_t>& triangle_ids, int fixed_face = -1) {
+    const std::vector<std::int64_t>& triangle_ids, const MeshBVH& mesh_bvh,
+    int fixed_face = -1) {
   MeshContactValue output;
   if (triangles.empty()) return output;
-  double best_distance2 = std::numeric_limits<double>::infinity();
-  int best = -1;
-  Vec3 best_point = Vec3::Zero();
-  const int first_face = fixed_face >= 0 ? fixed_face : 0;
-  const int last_face = fixed_face >= 0 ? fixed_face + 1 : static_cast<int>(normals.size());
-  for (int face = first_face; face < last_face; ++face) {
-    const Vec3 closest = closest_point_triangle(
-        point, triangles[3 * face], triangles[3 * face + 1], triangles[3 * face + 2]);
-    const double distance2 = (point - closest).squaredNorm();
-    if (distance2 < best_distance2) {
-      best_distance2 = distance2;
-      best = face;
-      best_point = closest;
-    }
-  }
+  // Newton iterations deliberately retain the predicted face.  Only initial
+  // and standalone contact searches use the immutable BVH.
+  const int best = fixed_face >= 0 ? fixed_face : nearest_mesh_face(point, mesh_bvh);
   if (best < 0) return output;
   const Vec3 normal = normals[best];
   const double clearance = normal.dot(point - triangles[3 * best]);
@@ -421,7 +374,6 @@ MeshContactValue evaluate_mesh_contact(
   output.value.active = active;
   output.value.distance = clearance;
   output.triangle_id = triangle_ids[best];
-  (void)best_point;
   return output;
 }
 
@@ -435,6 +387,24 @@ struct BlockPentaSystem {
 
   int size() const { return static_cast<int>(diagonal.size()); }
 
+  void reset() {
+    std::fill(diagonal.begin(), diagonal.end(), Mat3::Zero());
+    std::fill(upper1.begin(), upper1.end(), Mat3::Zero());
+    std::fill(lower1.begin(), lower1.end(), Mat3::Zero());
+    std::fill(upper2.begin(), upper2.end(), Mat3::Zero());
+    std::fill(lower2.begin(), lower2.end(), Mat3::Zero());
+  }
+
+  void copy_values_from(const BlockPentaSystem& other) {
+    if (size() != other.size())
+      throw std::logic_error("block-pentadiagonal scratch size mismatch");
+    std::copy(other.diagonal.begin(), other.diagonal.end(), diagonal.begin());
+    std::copy(other.upper1.begin(), other.upper1.end(), upper1.begin());
+    std::copy(other.lower1.begin(), other.lower1.end(), lower1.begin());
+    std::copy(other.upper2.begin(), other.upper2.end(), upper2.begin());
+    std::copy(other.lower2.begin(), other.lower2.end(), lower2.begin());
+  }
+
   void add_block(int row, int col, const Mat3& value) {
     const int offset = col - row;
     if (offset == 0) diagonal[row] += value;
@@ -446,20 +416,19 @@ struct BlockPentaSystem {
       throw std::logic_error("DER Jacobian exceeded block-pentadiagonal bandwidth");
   }
 
-  Eigen::VectorXd matvec(const Eigen::VectorXd& x) const {
-    Eigen::VectorXd y = Eigen::VectorXd::Zero(3 * size());
+  void matvec(const Eigen::VectorXd& x, Eigen::VectorXd* y) const {
+    y->setZero();
     for (int i = 0; i < size(); ++i) {
-      y.segment<3>(3 * i) += diagonal[i] * x.segment<3>(3 * i);
+      y->segment<3>(3 * i) += diagonal[i] * x.segment<3>(3 * i);
       if (i + 1 < size()) {
-        y.segment<3>(3 * i) += upper1[i] * x.segment<3>(3 * (i + 1));
-        y.segment<3>(3 * (i + 1)) += lower1[i] * x.segment<3>(3 * i);
+        y->segment<3>(3 * i) += upper1[i] * x.segment<3>(3 * (i + 1));
+        y->segment<3>(3 * (i + 1)) += lower1[i] * x.segment<3>(3 * i);
       }
       if (i + 2 < size()) {
-        y.segment<3>(3 * i) += upper2[i] * x.segment<3>(3 * (i + 2));
-        y.segment<3>(3 * (i + 2)) += lower2[i] * x.segment<3>(3 * i);
+        y->segment<3>(3 * i) += upper2[i] * x.segment<3>(3 * (i + 2));
+        y->segment<3>(3 * (i + 2)) += lower2[i] * x.segment<3>(3 * i);
       }
     }
-    return y;
   }
 
   Eigen::MatrixXd dense_reference() const {
@@ -482,21 +451,32 @@ struct BlockPentaSystem {
 };
 
 struct SolveResult {
-  Eigen::VectorXd solution;
   bool used_dense_fallback = false;
   double relative_residual = std::numeric_limits<double>::infinity();
 };
 
+struct BlockPentaSolveScratch {
+  explicit BlockPentaSolveScratch(int blocks)
+      : factor_system(blocks), rhs_blocks(blocks, 3), matvec(3 * blocks) {}
+
+  BlockPentaSystem factor_system;
+  Eigen::Matrix<double, Eigen::Dynamic, 3> rhs_blocks;
+  Eigen::VectorXd matvec;
+};
+
 SolveResult block_penta_solve(const BlockPentaSystem& system,
                                const Eigen::VectorXd& rhs,
-                               bool force_dense) {
+                               bool force_dense,
+                               BlockPentaSolveScratch* scratch,
+                               Eigen::VectorXd* solution) {
   const int blocks = system.size();
-  std::vector<Mat3> diagonal = system.diagonal;
-  std::vector<Mat3> upper1 = system.upper1;
-  std::vector<Mat3> upper2 = system.upper2;
-  std::vector<Mat3> lower1 = system.lower1;
-  std::vector<Mat3> lower2 = system.lower2;
-  Eigen::Matrix<double, Eigen::Dynamic, 3> vector(blocks, 3);
+  scratch->factor_system.copy_values_from(system);
+  auto& diagonal = scratch->factor_system.diagonal;
+  auto& upper1 = scratch->factor_system.upper1;
+  auto& upper2 = scratch->factor_system.upper2;
+  auto& lower1 = scratch->factor_system.lower1;
+  auto& lower2 = scratch->factor_system.lower2;
+  auto& vector = scratch->rhs_blocks;
   for (int i = 0; i < blocks; ++i)
     vector.row(i) = rhs.segment<3>(3 * i).transpose();
   bool failed = force_dense;
@@ -523,32 +503,76 @@ SolveResult block_penta_solve(const BlockPentaSystem& system,
       vector.row(i + 2) -= (factor * vector.row(i).transpose()).transpose();
     }
   }
-  Eigen::VectorXd solution = Eigen::VectorXd::Zero(rhs.size());
+  solution->setZero();
   if (!failed) {
     for (int i = blocks - 1; i >= 0; --i) {
       Eigen::Vector3d value = vector.row(i).transpose();
-      if (i + 1 < blocks) value -= upper1[i] * solution.segment<3>(3 * (i + 1));
-      if (i + 2 < blocks) value -= upper2[i] * solution.segment<3>(3 * (i + 2));
-      solution.segment<3>(3 * i) = diagonal[i].partialPivLu().solve(value);
-      if (!solution.segment<3>(3 * i).allFinite()) {
+      if (i + 1 < blocks) value -= upper1[i] * solution->segment<3>(3 * (i + 1));
+      if (i + 2 < blocks) value -= upper2[i] * solution->segment<3>(3 * (i + 2));
+      solution->segment<3>(3 * i) = diagonal[i].partialPivLu().solve(value);
+      if (!solution->segment<3>(3 * i).allFinite()) {
         failed = true;
         break;
       }
     }
   }
   SolveResult result;
-  result.solution = solution;
-  result.relative_residual = !failed
-      ? (system.matvec(solution) - rhs).norm() / std::max(rhs.norm(), 1.0e-30)
-      : std::numeric_limits<double>::infinity();
+  if (!failed) {
+    system.matvec(*solution, &scratch->matvec);
+    scratch->matvec -= rhs;
+    result.relative_residual = scratch->matvec.norm() /
+                               std::max(rhs.norm(), 1.0e-30);
+  }
   if (!failed && result.relative_residual <= 1.0e-8) return result;
   result.used_dense_fallback = true;
   const Eigen::MatrixXd dense = system.dense_reference();
-  result.solution = dense.partialPivLu().solve(rhs);
+  *solution = dense.partialPivLu().solve(rhs);
   result.relative_residual =
-      (dense * result.solution - rhs).norm() / std::max(rhs.norm(), 1.0e-30);
+      (dense * *solution - rhs).norm() / std::max(rhs.norm(), 1.0e-30);
   return result;
 }
+
+struct SolverWorkspace {
+  SolverWorkspace(int node_count, int free_node_count)
+      : old_q(3 * free_node_count),
+        q(3 * free_node_count),
+        prescribed(3 * node_count),
+        old_full(3 * node_count),
+        velocity_full(3 * node_count),
+        pulse_full(3 * node_count),
+        previous_error(node_count),
+        full(3 * node_count),
+        full_result(3 * node_count),
+        gradient(3 * node_count),
+        contact_force(3 * node_count),
+        contact_jacobian(node_count, Mat3::Zero()),
+        residual(3 * free_node_count),
+        trial_residual(3 * free_node_count),
+        trial(3 * free_node_count),
+        delta(3 * free_node_count),
+        solve_rhs(3 * free_node_count),
+        new_velocity(3 * node_count),
+        jacobian(free_node_count),
+        solve_scratch(free_node_count),
+        mesh_frozen_faces(node_count, -1) {}
+
+  void reset_assembly(bool with_jacobian) {
+    gradient.setZero();
+    contact_force.setZero();
+    if (with_jacobian)
+      std::fill(contact_jacobian.begin(), contact_jacobian.end(), Mat3::Zero());
+  }
+
+  Eigen::VectorXd old_q, q, prescribed;
+  Eigen::VectorXd old_full, velocity_full, pulse_full, previous_error;
+  Eigen::VectorXd full, full_result, gradient, contact_force;
+  std::vector<Mat3> contact_jacobian;
+  Eigen::VectorXd residual, trial_residual, trial, delta, solve_rhs;
+  Eigen::VectorXd new_velocity;
+  BlockPentaSystem jacobian;
+  BlockPentaSolveScratch solve_scratch;
+  std::vector<int> mesh_frozen_faces;
+};
 
 }  // namespace
 
@@ -623,6 +647,7 @@ void DERCore::configure_mesh(const py::array& triangles, const py::array& normal
     mesh_normals_[face] /= normal_length;
     mesh_triangle_ids_[face] = id_ptr[face];
   }
+  mesh_bvh_.build(mesh_triangles_);
   mesh_enabled_ = !mesh_normals_.empty();
 }
 
@@ -683,12 +708,23 @@ py::tuple DERCore::bending_kernel(const py::array& positions,
   auto* g = static_cast<double*>(gradient.request().ptr);
   auto* h = static_cast<double*>(hessian.request().ptr);
   for (ssize_t i = 0; i < elements; ++i) {
-    Eigen::Matrix<Jet<9>, 9, 1> vars;
-    for (int k = 0; k < 9; ++k) vars(k) = Jet<9>::variable(x[3 * i + k], k);
-    const Jet<9> energy = bending_energy(vars, l0[i], l0[i + 1], ei_);
+    BendingVector9 local_positions;
+    for (int k = 0; k < 9; ++k) local_positions(k) = x[3 * i + k];
+    BendingVector9 local_gradient;
+    BendingMatrix9 local_hessian;
+    if (!analytic_bending_derivatives(local_positions, l0[i], l0[i + 1], ei_,
+                                      &local_gradient, &local_hessian)) {
+      Eigen::Matrix<Jet<9>, 9, 1> vars;
+      for (int k = 0; k < 9; ++k)
+        vars(k) = Jet<9>::variable(local_positions(k), k);
+      const Jet<9> energy = bending_energy(vars, l0[i], l0[i + 1], ei_);
+      local_gradient = energy.gradient;
+      local_hessian = energy.hessian;
+    }
     for (int a = 0; a < 9; ++a) {
-      g[i * 9 + a] = energy.gradient(a);
-      for (int b = 0; b < 9; ++b) h[i * 81 + a * 9 + b] = energy.hessian(a, b);
+      g[i * 9 + a] = local_gradient(a);
+      for (int b = 0; b < 9; ++b)
+        h[i * 81 + a * 9 + b] = local_hessian(a, b);
     }
   }
   return py::make_tuple(gradient, hessian);
@@ -728,7 +764,8 @@ py::dict DERCore::contact_kernel(const py::array& positions,
       const MeshContactValue value = evaluate_mesh_contact(
           Vec3(x[3 * n], x[3 * n + 1], x[3 * n + 2]), oi[n], pe[n], dt,
           kp_, ki_active, max_pi_force_, leak_rate_, max_integral_state_,
-          contact_smooth_length_, mesh_triangles_, mesh_normals_, mesh_triangle_ids_);
+          contact_smooth_length_, mesh_triangles_, mesh_normals_, mesh_triangle_ids_,
+          mesh_bvh_);
       for (int k = 0; k < 3; ++k) {
         f[3 * n + k] = value.value.force(k);
         for (int l = 0; l < 3; ++l) j[9 * n + 3 * k + l] = value.value.jacobian(k, l);
@@ -860,12 +897,17 @@ py::dict DERCore::implicit_euler_step(
   const int first_free = 2;
   const int last_free = static_cast<int>(nodes) - (tip_constrained ? 1 : 0);
   const int free_nodes = last_free - first_free;
-  const int dofs = 3 * free_nodes;
   if (free_nodes <= 0) throw py::value_error("no free nodes in implicit step");
   const double beta = 1.0 / contact_smooth_length_;
   const auto started = std::chrono::steady_clock::now();
-  Eigen::VectorXd old_q(dofs), q(dofs), prescribed(3 * nodes);
-  Eigen::VectorXd old_full(3 * nodes), velocity_full(3 * nodes), pulse_full(3 * nodes);
+  SolverWorkspace workspace(static_cast<int>(nodes), free_nodes);
+  auto& old_q = workspace.old_q;
+  auto& q = workspace.q;
+  auto& prescribed = workspace.prescribed;
+  auto& old_full = workspace.old_full;
+  auto& velocity_full = workspace.velocity_full;
+  auto& pulse_full = workspace.pulse_full;
+  auto& previous_error = workspace.previous_error;
   for (int n = 0; n < nodes; ++n) {
     for (int k = 0; k < 3; ++k) {
       old_full(3 * n + k) = old_p[3 * n + k];
@@ -883,23 +925,23 @@ py::dict DERCore::implicit_euler_step(
     }
   }
 
-  mesh_frozen_faces_.assign(static_cast<std::size_t>(nodes), -1);
+  std::fill(workspace.mesh_frozen_faces.begin(),
+            workspace.mesh_frozen_faces.end(), -1);
   if (mesh_enabled_) {
     for (int n = 0; n < nodes; ++n) {
       Vec3 predictor = prescribed.segment<3>(3 * n);
       if (n >= first_free && n < last_free)
         predictor = q.segment<3>(3 * (n - first_free));
-      mesh_frozen_faces_[n] = nearest_mesh_face(predictor, mesh_triangles_);
+      workspace.mesh_frozen_faces[n] = nearest_mesh_face(predictor, mesh_bvh_);
     }
   }
 
-  Eigen::VectorXd previous_error(nodes);
   for (int n = 0; n < nodes; ++n) {
     if (mesh_enabled_) {
       const MeshContactValue value = evaluate_mesh_contact(
           old_full.segment<3>(3 * n), old_integral[n], 0.0, dt, kp_, ki_active,
           max_pi_force_, leak_rate_, max_integral_state_, contact_smooth_length_,
-          mesh_triangles_, mesh_normals_, mesh_triangle_ids_);
+          mesh_triangles_, mesh_normals_, mesh_triangle_ids_, mesh_bvh_);
       previous_error(n) = value.value.error;
     } else {
       const double radial = std::hypot(old_full(3 * n + 1), old_full(3 * n + 2));
@@ -921,11 +963,15 @@ py::dict DERCore::implicit_euler_step(
   auto assemble = [&](const Eigen::VectorXd& current, bool with_jacobian,
                       Eigen::VectorXd* residual, BlockPentaSystem* system,
                       Eigen::VectorXd* full_out) {
-    Eigen::VectorXd full = prescribed;
+    auto& full = workspace.full;
+    auto& gradient = workspace.gradient;
+    auto& contact_force = workspace.contact_force;
+    auto& contact_jac = workspace.contact_jacobian;
+    full = prescribed;
     for (int n = first_free; n < last_free; ++n)
       full.segment<3>(3 * n) = current.segment<3>(3 * (n - first_free));
-    Eigen::VectorXd gradient = Eigen::VectorXd::Zero(3 * nodes);
-    if (with_jacobian) *system = BlockPentaSystem(free_nodes);
+    workspace.reset_assembly(with_jacobian);
+    if (with_jacobian) workspace.jacobian.reset();
 
     for (int n = 0; n < nodes - 1; ++n) {
       const Vec3 d = full.segment<3>(3 * (n + 1)) - full.segment<3>(3 * n);
@@ -947,42 +993,52 @@ py::dict DERCore::implicit_euler_step(
 
     for (int n = 0; n < nodes - 2; ++n) {
       const int ns[3] = {n, n + 1, n + 2};
+      BendingVector9 local_positions;
+      for (int k = 0; k < 3; ++k) {
+        local_positions(k) = full(3 * n + k);
+        local_positions(3 + k) = full(3 * (n + 1) + k);
+        local_positions(6 + k) = full(3 * (n + 2) + k);
+      }
       if (with_jacobian) {
-        Eigen::Matrix<Jet<9>, 9, 1> vars;
-        for (int k = 0; k < 3; ++k) {
-          vars(k) = Jet<9>::variable(full(3 * n + k), k);
-          vars(3 + k) = Jet<9>::variable(full(3 * (n + 1) + k), 3 + k);
-          vars(6 + k) = Jet<9>::variable(full(3 * (n + 2) + k), 6 + k);
+        BendingVector9 local_gradient;
+        BendingMatrix9 local_hessian;
+        if (!analytic_bending_derivatives(local_positions, rest[n], rest[n + 1],
+                                          ei_, &local_gradient, &local_hessian)) {
+          Eigen::Matrix<Jet<9>, 9, 1> vars;
+          for (int k = 0; k < 9; ++k)
+            vars(k) = Jet<9>::variable(local_positions(k), k);
+          const auto energy = bending_energy(vars, rest[n], rest[n + 1], ei_);
+          local_gradient = energy.gradient;
+          local_hessian = energy.hessian;
         }
-        const auto energy = bending_energy(vars, rest[n], rest[n + 1], ei_);
         for (int a = 0; a < 3; ++a)
           for (int ra = 0; ra < 3; ++ra)
-            gradient.segment<3>(3 * ns[ra])(a) += energy.gradient(3 * ra + a);
+            gradient.segment<3>(3 * ns[ra])(a) += local_gradient(3 * ra + a);
         for (int ra = 0; ra < 3; ++ra) {
           for (int cb = 0; cb < 3; ++cb) {
             Mat3 block = Mat3::Zero();
             for (int a = 0; a < 3; ++a)
               for (int b = 0; b < 3; ++b)
-                block(a, b) = energy.hessian(3 * ra + a, 3 * cb + b);
+                block(a, b) = local_hessian(3 * ra + a, 3 * cb + b);
             add_local_block(system, ns[ra], ns[cb], block);
           }
         }
       } else {
-        Eigen::Matrix<FirstJet<9>, 9, 1> vars;
-        for (int k = 0; k < 3; ++k) {
-          vars(k) = FirstJet<9>::variable(full(3 * n + k), k);
-          vars(3 + k) = FirstJet<9>::variable(full(3 * (n + 1) + k), 3 + k);
-          vars(6 + k) = FirstJet<9>::variable(full(3 * (n + 2) + k), 6 + k);
+        BendingVector9 local_gradient;
+        if (!analytic_bending_gradient(local_positions, rest[n], rest[n + 1], ei_,
+                                       &local_gradient)) {
+          Eigen::Matrix<FirstJet<9>, 9, 1> vars;
+          for (int k = 0; k < 9; ++k)
+            vars(k) = FirstJet<9>::variable(local_positions(k), k);
+          const auto energy = first_bending_energy(vars, rest[n], rest[n + 1], ei_);
+          local_gradient = energy.gradient;
         }
-        const auto energy = first_bending_energy(vars, rest[n], rest[n + 1], ei_);
         for (int a = 0; a < 3; ++a)
           for (int ra = 0; ra < 3; ++ra)
-            gradient.segment<3>(3 * ns[ra])(a) += energy.gradient(3 * ra + a);
+            gradient.segment<3>(3 * ns[ra])(a) += local_gradient(3 * ra + a);
       }
     }
 
-    Eigen::VectorXd contact_force = Eigen::VectorXd::Zero(3 * nodes);
-    std::vector<Mat3> contact_jac(nodes, Mat3::Zero());
     const double decay = std::exp(-leak_rate_ * dt);
     for (int n = 0; n < nodes; ++n) {
       if (mesh_enabled_) {
@@ -990,7 +1046,7 @@ py::dict DERCore::implicit_euler_step(
             full.segment<3>(3 * n), old_integral[n], previous_error(n), dt, kp_,
             ki_active, max_pi_force_, leak_rate_, max_integral_state_,
             contact_smooth_length_, mesh_triangles_, mesh_normals_, mesh_triangle_ids_,
-            mesh_frozen_faces_[n]);
+            mesh_bvh_, workspace.mesh_frozen_faces[n]);
         contact_force.segment<3>(3 * n) = value.value.force;
         if (with_jacobian) contact_jac[n] = value.value.jacobian;
         continue;
@@ -1033,7 +1089,7 @@ py::dict DERCore::implicit_euler_step(
         contact_jac[n] = cj;
       }
     }
-    *residual = Eigen::VectorXd::Zero(dofs);
+    residual->setZero();
     for (int n = first_free; n < last_free; ++n) {
       const int block = n - first_free;
       for (int k = 0; k < 3; ++k) {
@@ -1053,8 +1109,9 @@ py::dict DERCore::implicit_euler_step(
     if (full_out) *full_out = full;
   };
 
-  Eigen::VectorXd residual, full_result;
-  BlockPentaSystem jacobian(free_nodes);
+  auto& residual = workspace.residual;
+  auto& full_result = workspace.full_result;
+  auto& jacobian = workspace.jacobian;
   double residual_norm = 0.0, step_norm = 0.0;
   bool converged = false;
   int iterations = 0, line_search_failures = 0, dense_fallback_count = 0;
@@ -1083,12 +1140,15 @@ py::dict DERCore::implicit_euler_step(
     }
     const auto solve_begin = std::chrono::steady_clock::now();
     const bool force_dense = stagnation_count >= 3;
-    const SolveResult solved = block_penta_solve(jacobian, -residual, force_dense);
+    workspace.solve_rhs = -residual;
+    const SolveResult solved = block_penta_solve(
+        jacobian, workspace.solve_rhs, force_dense, &workspace.solve_scratch,
+        &workspace.delta);
     solve_seconds += std::chrono::duration<double>(
         std::chrono::steady_clock::now() - solve_begin).count();
     ++banded_solve_count;
     if (solved.used_dense_fallback) ++dense_fallback_count;
-    const Eigen::VectorXd delta = solved.solution;
+    const auto& delta = workspace.delta;
     if (!delta.allFinite()) throw std::runtime_error("C++ Newton solve produced NaN/Inf");
     step_norm = delta.norm();
     if (step_norm < step_tol) {
@@ -1100,14 +1160,14 @@ py::dict DERCore::implicit_euler_step(
     bool accepted = false;
     const auto line_begin = std::chrono::steady_clock::now();
     for (int trial_index = 0; trial_index < 12; ++trial_index) {
-      const Eigen::VectorXd trial = q + alpha * delta;
-      Eigen::VectorXd trial_residual;
-      timed_assemble(trial, false, &trial_residual, nullptr, nullptr);
+      workspace.trial = q + alpha * delta;
+      timed_assemble(workspace.trial, false, &workspace.trial_residual,
+                     nullptr, nullptr);
       ++line_search_evaluations;
-      const double trial_norm = trial_residual.norm();
+      const double trial_norm = workspace.trial_residual.norm();
       if (std::isfinite(trial_norm) && trial_norm < base) {
-        q = trial;
-        residual = trial_residual;
+        q = workspace.trial;
+        residual = workspace.trial_residual;
         residual_norm = trial_norm;
         accepted = true;
         break;
@@ -1128,7 +1188,8 @@ py::dict DERCore::implicit_euler_step(
     residual_norm = residual.norm();
   }
   if (!converged && residual_norm < residual_tol) converged = true;
-  Eigen::VectorXd new_velocity = (full_result - old_full) / dt;
+  auto& new_velocity = workspace.new_velocity;
+  new_velocity = (full_result - old_full) / dt;
   for (int n = 0; n < 2; ++n) new_velocity.segment<3>(3 * n).setZero();
   if (tip_constrained) new_velocity.segment<3>(3 * (nodes - 1)) =
       (prescribed.segment<3>(3 * (nodes - 1)) - old_full.segment<3>(3 * (nodes - 1))) / dt;

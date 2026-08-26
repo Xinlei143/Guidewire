@@ -28,10 +28,16 @@ def _load_module():
 
     source_files = [
         str(_ROOT / "cpp" / "der_core.cpp"),
+        str(_ROOT / "cpp" / "der_bending.cpp"),
+        str(_ROOT / "cpp" / "mesh_bvh.cpp"),
         str(_ROOT / "cpp" / "bindings.cpp"),
     ]
     digest = hashlib.sha1()
-    for path in source_files + [str(_ROOT / "cpp" / "der_core.h")]:
+    for path in source_files + [
+        str(_ROOT / "cpp" / "der_core.h"),
+        str(_ROOT / "cpp" / "der_bending.h"),
+        str(_ROOT / "cpp" / "mesh_bvh.h"),
+    ]:
         digest.update(Path(path).read_bytes())
     name = f"der_core_cpp_{digest.hexdigest()[:12]}"
     build_directory = Path(tempfile.gettempdir()) / "softrobot_der_cpp"

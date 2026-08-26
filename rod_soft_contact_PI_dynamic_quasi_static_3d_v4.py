@@ -41,7 +41,7 @@ DIAMETER = 0.001                   # 导丝直径，影响横截面积、质量�
 MATERIAL_DENSITY = 7850.0          # 材料密度，kg/m^3
 YOUNG_MODULUS = 200.0e9            # 杨氏模量，越大表示导丝越不容易拉伸和弯曲
 DAMPING_RATIO = 1.0                # 阻尼比例；增大可更快消除振动，但过大可能使收敛变慢
-NUM_NODES = 250                    # 导丝节点数；越大越精细，但计算量也显著增加
+NUM_NODES = 500                    # 导丝节点数；越大越精细，但计算量也显著增加
 
 # --- 直圆管与 PI 软接触 ---
 TUBE_RADIUS = 60e-3                # 直管内半径；管轴为 x 轴
@@ -55,7 +55,7 @@ CONTACT_SMOOTH_LENGTH = 2e-5       # 接触开启的平滑长度；越大接触�
 DIRECTION_EPSILON = 1e-6           # 节点在管轴上时用于避免径向单位向量除零
 
 # --- 准静态求解与平衡判据 ---
-DT = 0.02                          # 隐式 Euler 单步时间；仅用于脉冲/松弛，不代表真实加载时间
+DT = 0.005                          # 隐式 Euler 单步时间；仅用于脉冲/松弛，不代表真实加载时间
 MAX_NEWTON_ITERS = 200             # 每个隐式步允许的 Newton 最大迭代次数
 NEWTON_RESIDUAL_TOL = 1e-7         # 单个 Newton 步的力残差收敛阈值
 NEWTON_STEP_TOL = 1e-10            # Newton 位移修正很小时的停止阈值
