@@ -3,7 +3,7 @@
 当前 README 以 v4 为主。v4 是独立的三维导丝准静态仿真入口，包含：
 
 - 无扭转离散弹性杆（DER）的拉伸、弯曲和隐式 Euler/Newton 求解；
-- 解析直圆管接触或 OBJ 三角网格接触；
+- 解析直圆管接触或 OBJ/STL 三角网格接触；
 - 初始随机横向脉冲、末端位移续加载和自适应松弛；
 - Python/PyTorch 参考后端与 C++ CPU 后端；
 - NPZ 历史、最终 PNG 和 TSV 汇总输出。
@@ -58,10 +58,29 @@ conda run --no-capture-output -n pendulum-rl python -u \
   --pulse-seed 42 --no-show
 ```
 
-### 2.2 OBJ 三角网格接触
+### 2.2 OBJ/STL 三角网格接触
 
-下面的 OBJ 是仓库中与 v4 参数匹配的保护管网格。`mesh` 模式必须提供一个
-存在的 OBJ，且文件中需要有名称包含 `protection` 的面组。
+下面的 OBJ 是仓库中与 v4 参数匹配的保护管网格。`mesh` 模式支持 OBJ 以及
+ASCII/binary STL；OBJ 必须包含名称含 `protection` 的面组，STL 会将全部三角形
+作为 protection surface。
+
+网格初始化时，v4 对 protection surface 建立 edge adjacency，在每个 connected
+component 内用 BFS 恢复一致 triangle winding，提取所有 boundary loops，并只在
+方向判定期间用 centroid fan 临时封口后计算 signed volume。临时 cap 不会进入
+runtime contact mesh、C++ `MeshBVH` 或 Newton contact search，因此不依赖全局 x/y/z
+轴，也不要求额外的 centerline。无法处理的 non-manifold、严重非平面/自交边界、
+退化三角形或近零 signed volume 会以 geometry validation error 拒绝。
+
+网格表示的是已经编码在 OBJ/STL 中的 protection surface。其语义是：
+
+```text
+mesh contact operates on the protection surface encoded in the mesh;
+safe_distance is not applied a second time during runtime mesh contact.
+```
+
+初始化会记录 `mesh_parse_ms`、`mesh_orientation_ms`、`mesh_cap_ms` 和
+`mesh_preprocess_total_ms`，并在 mesh simulation 启动时打印。它们只属于一次性
+mesh initialization，不计入后续每个 Dt / Newton step 的 `wall_time`。
 
 ```bash
 # Python backend
@@ -206,8 +225,10 @@ conda run --no-capture-output -n pendulum-rl python -u \
 
 ### mesh 模式找不到网格
 
-确认当前工作目录是仓库根目录，或者给 `--mesh-obj` 传绝对路径；同时确认 OBJ
-中存在名称包含 `protection` 的面组。
+确认当前工作目录是仓库根目录，或者给 `--mesh-obj` 传绝对路径；OBJ 需要存在
+名称包含 `protection` 的面组，STL 则应包含完整三角形 facets。若网格存在
+non-manifold edge、无法闭合的 boundary loop、严重非平面/自交 boundary 或近零
+signed volume，初始化会明确报错而不会猜测 lumen 方向。
 
 ### 单个载荷步失败
 
@@ -219,7 +240,7 @@ conda run --no-capture-output -n pendulum-rl python -u \
 
 ```text
 rod_soft_contact_PI_dynamic_quasi_static_3d_v4.py  v4 主入口、实验管理和可视化
-mesh_contact_v4.py                                 OBJ 网格解析与接触几何
+mesh_contact_v4.py                                 OBJ/STL 网格解析与接触几何
 der_cpp_backend.py                                 C++ 扩展的 Python 边界
 cpp/                                                Eigen/C++ DER 核心和构建脚本
 tube_obj/                                           v4 网格接触用 OBJ

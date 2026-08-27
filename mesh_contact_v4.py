@@ -1,4 +1,4 @@
-"""Independent OBJ-triangle contact geometry for the v4 DER solver.
+"""Independent OBJ/STL triangle contact geometry for the v4 DER solver.
 
 The module deliberately contains no v3 imports.  Geometry/search state is kept
 outside the DER state so Newton can freeze and transactionally restore it.
@@ -6,14 +6,38 @@ outside the DER state so Newton can freeze and transactionally restore it.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import product
 import math
 from pathlib import Path
+import struct
+import time
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+
+_DEGENERATE_TRIANGLE_TOLERANCE = 1.0e-12
+_CAP_PLANARITY_RELATIVE_TOLERANCE = 1.0e-5
+_CAP_AREA_RELATIVE_TOLERANCE = 1.0e-10
+_VOLUME_RELATIVE_TOLERANCE = 1.0e-10
+
+
+@dataclass(frozen=True)
+class MeshPreprocessStats:
+    mesh_parse_ms: float
+    mesh_orientation_ms: float
+    mesh_cap_ms: float
+    mesh_preprocess_total_ms: float
+
+    def as_dict(self) -> dict[str, float]:
+        return {
+            "mesh_parse_ms": self.mesh_parse_ms,
+            "mesh_orientation_ms": self.mesh_orientation_ms,
+            "mesh_cap_ms": self.mesh_cap_ms,
+            "mesh_preprocess_total_ms": self.mesh_preprocess_total_ms,
+        }
 
 
 @dataclass(frozen=True)
@@ -139,11 +163,374 @@ def _parse_obj(path: Path) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray
     }
 
 
+def _parse_stl(path: Path) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
+    """Read ASCII or binary STL and weld repeated facet vertices exactly."""
+    data = path.read_bytes()
+    binary_count = struct.unpack_from("<I", data, 80)[0] if len(data) >= 84 else 0
+    is_binary = len(data) >= 84 and 84 + 50 * binary_count == len(data)
+    raw_triangles: list[tuple[tuple[float, float, float], ...]] = []
+    if is_binary:
+        if binary_count == 0:
+            raise ValueError(f"STL contains no triangles: {path}")
+        for triangle_id in range(binary_count):
+            offset = 84 + 50 * triangle_id
+            values = struct.unpack_from("<12f", data, offset)
+            raw_triangles.append((
+                (float(values[3]), float(values[4]), float(values[5])),
+                (float(values[6]), float(values[7]), float(values[8])),
+                (float(values[9]), float(values[10]), float(values[11])),
+            ))
+    else:
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError(f"STL is neither valid binary nor ASCII: {path}") from error
+        raw_vertices: list[tuple[float, float, float]] = []
+        for line_number, raw in enumerate(text.splitlines(), start=1):
+            fields = raw.split()
+            if not fields or fields[0].lower() != "vertex":
+                continue
+            if len(fields) < 4:
+                raise ValueError(f"STL vertex is malformed on line {line_number}: {path}")
+            try:
+                point = tuple(float(value) for value in fields[1:4])
+            except ValueError as error:
+                raise ValueError(f"STL vertex is malformed on line {line_number}: {path}") from error
+            raw_vertices.append(point)
+        if not raw_vertices or len(raw_vertices) % 3:
+            raise ValueError(f"STL does not contain complete triangular facets: {path}")
+        raw_triangles = [tuple(raw_vertices[index:index + 3]) for index in range(0, len(raw_vertices), 3)]
+
+    vertices: list[tuple[float, float, float]] = []
+    vertex_ids: dict[tuple[float, float, float], int] = {}
+    faces: list[tuple[int, int, int]] = []
+    for triangle in raw_triangles:
+        face: list[int] = []
+        for point in triangle:
+            vertex_id = vertex_ids.get(point)
+            if vertex_id is None:
+                vertex_id = len(vertices)
+                vertex_ids[point] = vertex_id
+                vertices.append(point)
+            face.append(vertex_id)
+        faces.append(tuple(face))
+    if not vertices or not faces:
+        raise ValueError(f"STL contains no usable vertices or triangles: {path}")
+    return (
+        np.asarray(vertices, dtype=np.float64),
+        np.asarray(faces, dtype=np.int64),
+        {"protection": np.arange(len(faces), dtype=np.int64)},
+    )
+
+
 def _select_group(groups: dict[str, np.ndarray], keyword: str) -> np.ndarray:
     selected = [ids for name, ids in groups.items() if keyword.lower() in name.lower()]
     if not selected:
         raise KeyError(f"OBJ mesh has no face group containing '{keyword}'. Groups: {list(groups)}")
     return np.concatenate(selected)
+
+
+def _directed_face_edges(face: np.ndarray) -> tuple[tuple[int, int], ...]:
+    return (
+        (int(face[0]), int(face[1])),
+        (int(face[1]), int(face[2])),
+        (int(face[2]), int(face[0])),
+    )
+
+
+def _build_edge_owners(faces: np.ndarray) -> dict[tuple[int, int], list[int]]:
+    """Build the undirected edge-to-face map for a local protection surface."""
+    edge_owners: dict[tuple[int, int], list[int]] = {}
+    for face_id, face in enumerate(faces):
+        for start, end in _directed_face_edges(face):
+            if start == end:
+                raise ValueError(
+                    f"degenerate protection triangle {face_id} contains a zero-length edge"
+                )
+            edge = tuple(sorted((start, end)))
+            owners = edge_owners.setdefault(edge, [])
+            owners.append(face_id)
+            if len(owners) > 2:
+                raise ValueError(
+                    "non-manifold protection surface: "
+                    f"edge {edge} has {len(owners)} adjacent faces"
+                )
+    return edge_owners
+
+
+def _edge_direction(face: np.ndarray, edge: tuple[int, int]) -> tuple[int, int]:
+    for directed in _directed_face_edges(face):
+        if set(directed) == set(edge):
+            return directed
+    raise ValueError(f"face does not contain edge {edge}")
+
+
+def _orient_faces_by_adjacency(
+    faces: np.ndarray,
+) -> tuple[np.ndarray, list[list[int]], dict[tuple[int, int], list[int]]]:
+    """Propagate a consistent winding through every face component."""
+    edge_owners = _build_edge_owners(faces)
+    adjacency: list[list[tuple[int, bool]]] = [[] for _ in range(len(faces))]
+    for edge, owners in edge_owners.items():
+        if len(owners) != 2:
+            continue
+        first, second = owners
+        same_direction = _edge_direction(faces[first], edge) == _edge_direction(faces[second], edge)
+        adjacency[first].append((second, same_direction))
+        adjacency[second].append((first, same_direction))
+
+    flip = np.full(len(faces), -1, dtype=np.int8)
+    components: list[list[int]] = []
+    for root in range(len(faces)):
+        if flip[root] >= 0:
+            continue
+        flip[root] = 0
+        stack = [root]
+        component: list[int] = []
+        while stack:
+            current = stack.pop()
+            component.append(current)
+            for neighbour, same_direction in adjacency[current]:
+                expected = int(flip[current]) ^ int(same_direction)
+                if flip[neighbour] < 0:
+                    flip[neighbour] = expected
+                    stack.append(neighbour)
+                elif int(flip[neighbour]) != expected:
+                    raise ValueError("cannot orient protection surface consistently")
+        components.append(sorted(component))
+
+    oriented = np.asarray(faces, dtype=np.int64).copy()
+    flipped = np.flatnonzero(flip.astype(bool))
+    if len(flipped):
+        oriented[flipped] = oriented[flipped][:, (0, 2, 1)]
+    for edge, owners in edge_owners.items():
+        if len(owners) == 2:
+            directions = [_edge_direction(oriented[face_id], edge) for face_id in owners]
+            if directions[0] != directions[1][::-1]:
+                raise ValueError("cannot orient protection surface consistently")
+    return oriented, components, edge_owners
+
+
+def _extract_boundary_loops(
+    faces: np.ndarray, edge_owners: dict[tuple[int, int], list[int]],
+    components: list[list[int]],
+) -> list[tuple[int, list[int]]]:
+    """Extract directed closed boundary cycles after winding propagation."""
+    component_ids = np.full(len(faces), -1, dtype=np.int64)
+    for component_id, component in enumerate(components):
+        component_ids[component] = component_id
+    component_edges: list[list[tuple[int, int]]] = [[] for _ in components]
+    for edge, owners in edge_owners.items():
+        if len(owners) != 1:
+            continue
+        face_id = owners[0]
+        component_id = int(component_ids[face_id])
+        if component_id < 0:
+            raise ValueError("cannot determine lumen orientation from mesh topology")
+        component_edges[component_id].append(_edge_direction(faces[face_id], edge))
+
+    loops: list[tuple[int, list[int]]] = []
+    for component_id, edges in enumerate(component_edges):
+        outgoing: dict[int, int] = {}
+        incoming: dict[int, int] = {}
+        for start, end in edges:
+            if start in outgoing or end in incoming:
+                raise ValueError(
+                    "cannot determine lumen orientation from mesh topology: "
+                    "boundary edges do not form closed loops"
+                )
+            outgoing[start] = end
+            incoming[end] = start
+        if set(outgoing) != set(incoming):
+            raise ValueError(
+                "cannot determine lumen orientation from mesh topology: "
+                "boundary edges do not form closed loops"
+            )
+
+        visited_edges: set[tuple[int, int]] = set()
+        for start in sorted(outgoing):
+            if (start, outgoing[start]) in visited_edges:
+                continue
+            loop: list[int] = []
+            current = start
+            while True:
+                if current not in outgoing:
+                    raise ValueError(
+                        "cannot determine lumen orientation from mesh topology: "
+                        "boundary edges do not form closed loops"
+                    )
+                end = outgoing[current]
+                directed = (current, end)
+                if directed in visited_edges:
+                    if current != start:
+                        raise ValueError(
+                            "cannot determine lumen orientation from mesh topology: "
+                            "boundary edges do not form closed loops"
+                        )
+                    break
+                visited_edges.add(directed)
+                loop.append(current)
+                current = end
+                if current == start:
+                    break
+                if len(loop) > len(edges):
+                    raise ValueError(
+                        "cannot determine lumen orientation from mesh topology: "
+                        "boundary edges do not form closed loops"
+                    )
+            if len(loop) < 3:
+                raise ValueError(
+                    "cannot determine lumen orientation from mesh topology: "
+                    "boundary loop has fewer than three edges"
+                )
+            loops.append((component_id, loop))
+        if len(visited_edges) != len(edges):
+            raise ValueError(
+                "cannot determine lumen orientation from mesh topology: "
+                "boundary edges do not form closed loops"
+            )
+    return loops
+
+
+def _cross2d(first: np.ndarray, second: np.ndarray, third: np.ndarray) -> float:
+    a = second - first
+    b = third - first
+    return float(a[0] * b[1] - a[1] * b[0])
+
+
+def _point_on_segment_2d(point: np.ndarray, start: np.ndarray, end: np.ndarray, tolerance: float) -> bool:
+    if abs(_cross2d(start, end, point)) > tolerance:
+        return False
+    return bool(
+        point[0] >= min(start[0], end[0]) - tolerance
+        and point[0] <= max(start[0], end[0]) + tolerance
+        and point[1] >= min(start[1], end[1]) - tolerance
+        and point[1] <= max(start[1], end[1]) + tolerance
+    )
+
+
+def _segments_intersect_2d(
+    first_start: np.ndarray, first_end: np.ndarray,
+    second_start: np.ndarray, second_end: np.ndarray,
+    tolerance: float,
+) -> bool:
+    lower = np.maximum(np.minimum(first_start, first_end), np.minimum(second_start, second_end))
+    upper = np.minimum(np.maximum(first_start, first_end), np.maximum(second_start, second_end))
+    if np.any(lower > upper + tolerance):
+        return False
+    values = (
+        _cross2d(first_start, first_end, second_start),
+        _cross2d(first_start, first_end, second_end),
+        _cross2d(second_start, second_end, first_start),
+        _cross2d(second_start, second_end, first_end),
+    )
+    if all(value > tolerance for value in values[:2]) or all(value < -tolerance for value in values[:2]):
+        return False
+    if all(value > tolerance for value in values[2:]) or all(value < -tolerance for value in values[2:]):
+        return False
+    return True
+
+
+def _point_in_polygon_2d(point: np.ndarray, polygon: np.ndarray, tolerance: float) -> bool:
+    inside = False
+    for index, start in enumerate(polygon):
+        end = polygon[(index + 1) % len(polygon)]
+        if _point_on_segment_2d(point, start, end, tolerance):
+            return True
+        crosses = (start[1] > point[1]) != (end[1] > point[1])
+        if crosses:
+            x_intersection = start[0] + (point[1] - start[1]) * (end[0] - start[0]) / (end[1] - start[1])
+            if x_intersection >= point[0] - tolerance:
+                inside = not inside
+    return inside
+
+
+def _temporary_cap_for_loop(vertices: np.ndarray, loop: list[int]) -> np.ndarray:
+    """Create a validated centroid fan used only for orientation."""
+    if len(loop) < 3 or len(set(loop)) != len(loop):
+        raise ValueError("boundary loop cannot be capped reliably: repeated or insufficient vertices")
+    points = np.asarray(vertices[np.asarray(loop, dtype=np.int64)], dtype=np.float64)
+    if not np.isfinite(points).all():
+        raise ValueError("boundary loop cannot be capped reliably: non-finite vertices")
+    edge_lengths = np.linalg.norm(np.roll(points, -1, axis=0) - points, axis=1)
+    span = float(np.linalg.norm(np.ptp(points, axis=0)))
+    if not np.isfinite(span) or span <= 0.0 or np.any(edge_lengths <= _DEGENERATE_TRIANGLE_TOLERANCE):
+        raise ValueError("boundary loop cannot be capped reliably: degenerate boundary edge")
+    tolerance = max(span * 1.0e-10, 1.0e-14)
+    centroid = points.mean(axis=0)
+    centered = points - centroid
+    try:
+        _, singular_values, vh = np.linalg.svd(centered, full_matrices=False)
+    except np.linalg.LinAlgError as error:
+        raise ValueError("boundary loop cannot be capped reliably: plane fit failed") from error
+    if len(singular_values) < 2 or singular_values[0] <= tolerance:
+        raise ValueError("boundary loop cannot be capped reliably: zero projected area")
+    plane_normal = vh[-1]
+    residual = float(np.max(np.abs(centered @ plane_normal)))
+    if residual > _CAP_PLANARITY_RELATIVE_TOLERANCE * max(span, 1.0e-12):
+        raise ValueError("boundary loop cannot be capped reliably: severely non-planar loop")
+    basis_u = vh[0] - np.dot(vh[0], plane_normal) * plane_normal
+    basis_u /= np.linalg.norm(basis_u)
+    basis_v = np.cross(plane_normal, basis_u)
+    projected = np.column_stack((centered @ basis_u, centered @ basis_v))
+    area = 0.5 * float(np.sum(projected[:, 0] * np.roll(projected[:, 1], -1)
+                               - projected[:, 1] * np.roll(projected[:, 0], -1)))
+    for first in range(len(projected)):
+        second = (first + 1) % len(projected)
+        for third in range(first + 1, len(projected)):
+            fourth = (third + 1) % len(projected)
+            if first == third or second == third or first == fourth:
+                continue
+            if _segments_intersect_2d(
+                projected[first], projected[second], projected[third], projected[fourth], tolerance,
+            ):
+                raise ValueError("boundary loop cannot be capped reliably: self-intersecting loop")
+    if abs(area) <= _CAP_AREA_RELATIVE_TOLERANCE * max(span * span, 1.0e-24):
+        raise ValueError("boundary loop cannot be capped reliably: zero projected area")
+    if not _point_in_polygon_2d(np.zeros(2), projected, tolerance):
+        raise ValueError("boundary loop cannot be capped reliably: centroid lies outside loop")
+
+    caps = np.stack(tuple(
+        (points[index], centroid, points[(index + 1) % len(points)])
+        for index in range(len(points))
+    ))
+    cap_normals = np.cross(caps[:, 1] - caps[:, 0], caps[:, 2] - caps[:, 0])
+    if np.any(np.linalg.norm(cap_normals, axis=1) <= _DEGENERATE_TRIANGLE_TOLERANCE):
+        raise ValueError("boundary loop cannot be capped reliably: degenerate fan triangle")
+    return caps
+
+
+def _component_signed_volume(
+    vertices: np.ndarray, faces: np.ndarray, component: list[int],
+    caps: list[np.ndarray],
+) -> float:
+    """Compute a translated signed volume for an oriented closed component."""
+    component_vertices = vertices[faces[np.asarray(component, dtype=np.int64)]].reshape(-1, 3)
+    if caps:
+        cap_points = tuple(cap.reshape(-1, 3) for cap in caps)
+        all_points = np.concatenate((component_vertices, *cap_points), axis=0)
+    else:
+        all_points = component_vertices
+    origin = all_points.mean(axis=0)
+    component_triangles = vertices[faces[np.asarray(component, dtype=np.int64)]] - origin
+    terms = np.einsum(
+        "ij,ij->i", component_triangles[:, 0],
+        np.cross(component_triangles[:, 1], component_triangles[:, 2]),
+    ) / 6.0
+    if caps:
+        cap_triangles = np.concatenate(caps, axis=0) - origin
+        terms = np.concatenate((terms, np.einsum(
+            "ij,ij->i", cap_triangles[:, 0],
+            np.cross(cap_triangles[:, 1], cap_triangles[:, 2]),
+        ) / 6.0))
+    volume = float(np.sum(terms))
+    span = float(np.linalg.norm(np.ptp(all_points, axis=0)))
+    volume_scale = float(np.sum(np.abs(terms)))
+    if not np.isfinite(volume) or abs(volume) <= _VOLUME_RELATIVE_TOLERANCE * max(
+        volume_scale, span ** 3, 1.0e-30,
+    ):
+        raise ValueError("closed mesh has near-zero signed volume")
+    return volume
 
 
 @dataclass
@@ -161,6 +548,27 @@ class MeshGeometry:
     local_neighbours: torch.Tensor
     initial_ring: int = 1
     max_ring: int = 8
+    preprocess_stats: MeshPreprocessStats = field(
+        default_factory=lambda: MeshPreprocessStats(0.0, 0.0, 0.0, 0.0)
+    )
+    connected_component_count: int = 0
+    boundary_loop_count: int = 0
+
+    @property
+    def mesh_parse_ms(self) -> float:
+        return self.preprocess_stats.mesh_parse_ms
+
+    @property
+    def mesh_orientation_ms(self) -> float:
+        return self.preprocess_stats.mesh_orientation_ms
+
+    @property
+    def mesh_cap_ms(self) -> float:
+        return self.preprocess_stats.mesh_cap_ms
+
+    @property
+    def mesh_preprocess_total_ms(self) -> float:
+        return self.preprocess_stats.mesh_preprocess_total_ms
 
     @classmethod
     def from_obj(
@@ -168,21 +576,55 @@ class MeshGeometry:
         device: torch.device | None = None, cell_size: float = 0.0,
         initial_ring: int = 1,
     ) -> "MeshGeometry":
+        preprocess_started = time.perf_counter()
         device = device or torch.device("cpu")
         path = Path(path).resolve()
-        vertices_np, faces_np, groups = _parse_obj(path)
+        parse_started = time.perf_counter()
+        if path.suffix.lower() == ".stl":
+            vertices_np, faces_np, groups = _parse_stl(path)
+        else:
+            vertices_np, faces_np, groups = _parse_obj(path)
+        mesh_parse_ms = (time.perf_counter() - parse_started) * 1.0e3
         protection_ids = _select_group(groups, protection_keyword)
-        triangles_np = vertices_np[faces_np[protection_ids]]
-        raw_normals = np.cross(triangles_np[:, 1] - triangles_np[:, 0], triangles_np[:, 2] - triangles_np[:, 0])
+        protection_faces = np.asarray(faces_np[protection_ids], dtype=np.int64).copy()
+        triangles_np = vertices_np[protection_faces]
+        if not np.isfinite(vertices_np).all():
+            raise ValueError("protection surface contains non-finite vertices")
+        raw_normals = np.cross(
+            triangles_np[:, 1] - triangles_np[:, 0],
+            triangles_np[:, 2] - triangles_np[:, 0],
+        )
         lengths = np.linalg.norm(raw_normals, axis=1)
-        if np.any(lengths < 1e-12):
-            raise ValueError("OBJ protection group contains a degenerate triangle")
+        if np.any(lengths <= _DEGENERATE_TRIANGLE_TOLERANCE):
+            raise ValueError("protection surface contains a degenerate triangle")
+        orientation_started = time.perf_counter()
+        oriented_faces, components, edge_owners = _orient_faces_by_adjacency(protection_faces)
+        boundary_loops = _extract_boundary_loops(oriented_faces, edge_owners, components)
+        mesh_orientation_ms = (time.perf_counter() - orientation_started) * 1.0e3
+
+        cap_started = time.perf_counter()
+        caps_by_component: list[list[np.ndarray]] = [[] for _ in components]
+        for component_id, loop in boundary_loops:
+            caps_by_component[component_id].append(_temporary_cap_for_loop(vertices_np, loop))
+        for component_id, component in enumerate(components):
+            signed_volume = _component_signed_volume(
+                vertices_np, oriented_faces, component, caps_by_component[component_id],
+            )
+            if signed_volume > 0.0:
+                oriented_faces[component] = oriented_faces[component][:, (0, 2, 1)]
+        mesh_cap_ms = (time.perf_counter() - cap_started) * 1.0e3
+
+        # Only the original protection triangles survive preprocessing.  The
+        # temporary caps above are deliberately not added to contact geometry.
+        faces_np = np.asarray(faces_np, dtype=np.int64).copy()
+        faces_np[protection_ids] = oriented_faces
+        triangles_np = vertices_np[oriented_faces]
+        raw_normals = np.cross(
+            triangles_np[:, 1] - triangles_np[:, 0],
+            triangles_np[:, 2] - triangles_np[:, 0],
+        )
+        lengths = np.linalg.norm(raw_normals, axis=1)
         normals_np = raw_normals / lengths[:, None]
-        centroids = triangles_np.mean(axis=1)
-        outward = np.sum(normals_np[:, 1:] * centroids[:, 1:], axis=1) > 0.0
-        normals_np[outward] *= -1.0
-        if np.any(np.sum(normals_np[:, 1:] * centroids[:, 1:], axis=1) >= -1e-12):
-            raise ValueError("could not orient every protection-face normal toward tube lumen")
         edges = np.stack((
             np.linalg.norm(triangles_np[:, 1] - triangles_np[:, 0], axis=1),
             np.linalg.norm(triangles_np[:, 2] - triangles_np[:, 1], axis=1),
@@ -210,10 +652,6 @@ class MeshGeometry:
             dense[flat, :len(ids)] = ids
 
         # Face adjacency is used for cheap cache validation; the grid remains the reliable fallback.
-        edge_owners: dict[tuple[int, int], list[int]] = {}
-        for face_id, face in enumerate(faces_np[protection_ids]):
-            for a, b in ((face[0], face[1]), (face[1], face[2]), (face[2], face[0])):
-                edge_owners.setdefault(tuple(sorted((int(a), int(b)))), []).append(face_id)
         adjacency = [set([i]) for i in range(len(triangles_np))]
         for owners in edge_owners.values():
             if len(owners) == 2:
@@ -230,6 +668,7 @@ class MeshGeometry:
         for index, ids in enumerate(neighbours):
             neighbour_table[index, :len(ids)] = ids
         tensor = lambda value, dtype: torch.as_tensor(value, dtype=dtype, device=device)
+        mesh_preprocess_total_ms = (time.perf_counter() - preprocess_started) * 1.0e3
         return cls(
             obj_path=path,
             vertices=tensor(vertices_np, torch.float64),
@@ -244,6 +683,14 @@ class MeshGeometry:
             local_neighbours=tensor(neighbour_table, torch.long),
             initial_ring=initial_ring,
             max_ring=max(initial_ring, 8),
+            preprocess_stats=MeshPreprocessStats(
+                mesh_parse_ms=mesh_parse_ms,
+                mesh_orientation_ms=mesh_orientation_ms,
+                mesh_cap_ms=mesh_cap_ms,
+                mesh_preprocess_total_ms=mesh_preprocess_total_ms,
+            ),
+            connected_component_count=len(components),
+            boundary_loop_count=len(boundary_loops),
         )
 
     def _grid_candidates(self, points: torch.Tensor, ring: int | None = None) -> torch.Tensor:
@@ -456,5 +903,5 @@ class MeshContactBackend:
 
 __all__ = [
     "MeshContactBackend", "MeshContactCache", "MeshContactDetails", "MeshContactState",
-    "MeshGeometry", "fixed_face_contact",
+    "MeshGeometry", "MeshPreprocessStats", "fixed_face_contact",
 ]

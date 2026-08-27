@@ -1212,7 +1212,16 @@ def run_simulation(args: argparse.Namespace) -> dict[str, np.ndarray]:
     masses = torch.as_tensor(masses, dtype=DTYPE, device=device)
     integrals = torch.as_tensor(integrals, dtype=DTYPE, device=device)
     if getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) == "mesh":
-        _ensure_mesh_geometry(args, device)
+        geometry = _ensure_mesh_geometry(args, device)
+        args.mesh_preprocess_stats = geometry.preprocess_stats.as_dict()
+        print(
+            "mesh preprocessing: "
+            f"parse={args.mesh_preprocess_stats['mesh_parse_ms']:.3f} ms, "
+            f"orientation={args.mesh_preprocess_stats['mesh_orientation_ms']:.3f} ms, "
+            f"cap={args.mesh_preprocess_stats['mesh_cap_ms']:.3f} ms, "
+            f"total={args.mesh_preprocess_stats['mesh_preprocess_total_ms']:.3f} ms",
+            flush=True,
+        )
     initial_positions = positions.detach().clone()
     args.dt_active = args.dt
     args.ki_active = args.Ki
@@ -2397,7 +2406,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backend", choices=("cpp", "python"), default=BACKEND_DEFAULT)
     parser.add_argument("--contact-type", choices=("tube", "mesh"), default=CONTACT_TYPE_DEFAULT)
-    parser.add_argument("--mesh-obj", type=Path, default=MESH_OBJ_DEFAULT)
+    parser.add_argument("--mesh-obj", type=Path, default=MESH_OBJ_DEFAULT, help="OBJ or ASCII/binary STL protection surface")
     parser.add_argument("--total-length", type=float, default=TOTAL_LENGTH)
     parser.add_argument("--diameter", type=float, default=DIAMETER)
     parser.add_argument("--density", type=float, default=MATERIAL_DENSITY)
@@ -2516,7 +2525,7 @@ def parse_args() -> argparse.Namespace:
     args.torch_device = resolve_device(args.device)
     args.mesh_obj = args.mesh_obj.expanduser().resolve()
     if args.contact_type == "mesh" and not args.mesh_obj.is_file():
-        parser.error(f"mesh OBJ does not exist: {args.mesh_obj}")
+        parser.error(f"mesh OBJ/STL does not exist: {args.mesh_obj}")
     if args.backend == "cpp" and args.device == "auto":
         args.torch_device = torch.device("cpu")
     elif args.backend == "cpp" and args.torch_device.type == "cuda":
