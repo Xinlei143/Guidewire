@@ -31,7 +31,6 @@ __pycache__/
 3d_picture
 deliverables
 docs
-tests
 rodsim_2d_vessel_boundary_PI
 Stretching_bending
 rod_soft_contact_PI_dynamic_quasi_static_2d_arc.py
