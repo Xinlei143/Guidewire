@@ -33,5 +33,4 @@ deliverables
 docs
 rodsim_2d_vessel_boundary_PI
 Stretching_bending
-rod_soft_contact_PI_dynamic_quasi_static_2d_arc.py
 soft_robot_chain_bending_stretching_torsion.py
