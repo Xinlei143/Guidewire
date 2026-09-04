@@ -30,6 +30,7 @@ def _load_module():
         str(_ROOT / "cpp" / "der_core.cpp"),
         str(_ROOT / "cpp" / "der_bending.cpp"),
         str(_ROOT / "cpp" / "mesh_bvh.cpp"),
+        str(_ROOT / "cpp" / "arc2d_core.cpp"),
         str(_ROOT / "cpp" / "bindings.cpp"),
     ]
     digest = hashlib.sha1()
@@ -37,6 +38,7 @@ def _load_module():
         str(_ROOT / "cpp" / "der_core.h"),
         str(_ROOT / "cpp" / "der_bending.h"),
         str(_ROOT / "cpp" / "mesh_bvh.h"),
+        str(_ROOT / "cpp" / "arc2d_core.h"),
     ]:
         digest.update(Path(path).read_bytes())
     name = f"der_core_cpp_{digest.hexdigest()[:12]}"
@@ -185,4 +187,76 @@ class DERCore:
         )
 
 
-__all__ = ["DERCore"]
+class Arc2DCore:
+    """Strict NumPy facade for the independent CPU float64 Arc2D core."""
+
+    def __init__(
+        self, rest_lengths, masses, ea, ei, damping, arc_radius,
+        tube_half_width, safe_distance, kp, ki, max_pi_force,
+        max_integral_state, leak_rate, contact_smooth_length=2.0e-5,
+        direction_epsilon=1.0e-6,
+    ):
+        self._rest_lengths = _array(rest_lengths, "rest_lengths")
+        self._masses = _array(masses, "masses")
+        self._kp = float(kp)
+        self._ki = float(ki)
+        self._impl = _load_module().Arc2DCore(
+            self._rest_lengths,
+            self._masses,
+            float(ea),
+            float(ei),
+            float(damping),
+            float(arc_radius),
+            float(tube_half_width),
+            float(safe_distance),
+            self._kp,
+            self._ki,
+            float(max_pi_force),
+            float(max_integral_state),
+            float(leak_rate),
+            float(contact_smooth_length),
+            float(direction_epsilon),
+        )
+
+    def contact_kernel(
+        self, positions, integrals, previous_errors, dt,
+        kp_active=None, ki_active=None,
+    ):
+        return self._impl.contact_kernel(
+            _array(positions, "positions"),
+            _array(integrals, "integrals"),
+            _array(previous_errors, "previous_errors"),
+            float(dt),
+            self._kp if kp_active is None else float(kp_active),
+            self._ki if ki_active is None else float(ki_active),
+        )
+
+    def implicit_euler_step(
+        self, positions, velocities, integrals, previous_errors, prescribed,
+        pulse_forces, reference_curvature, tip_constrained, dt,
+        max_newton_iters, residual_tol, step_tol, kp_active=None,
+        ki_active=None,
+    ):
+        return self._impl.implicit_euler_step(
+            _array(positions, "positions"),
+            _array(velocities, "velocities"),
+            _array(integrals, "integrals"),
+            _array(previous_errors, "previous_errors"),
+            _array(prescribed, "prescribed"),
+            _array(pulse_forces, "pulse_forces"),
+            _array(reference_curvature, "reference_curvature"),
+            bool(tip_constrained),
+            float(dt),
+            int(max_newton_iters),
+            float(residual_tol),
+            float(step_tol),
+            self._kp if kp_active is None else float(kp_active),
+            self._ki if ki_active is None else float(ki_active),
+        )
+
+    def implicit_euler_step_cached(self, *args, **kwargs):
+        """Alias retaining the constructor-owned rest/mass cache contract."""
+        return self.implicit_euler_step(*args, **kwargs)
+
+
+__all__ = ["DERCore", "Arc2DCore"]

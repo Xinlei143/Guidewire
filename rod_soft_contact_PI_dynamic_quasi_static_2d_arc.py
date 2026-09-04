@@ -31,6 +31,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+import der_cpp_backend
+
 
 DTYPE = torch.float64  # 全部使用双精度，保证曲率、接触和 Newton 的精度。
 
@@ -61,7 +63,7 @@ CONTACT_SMOOTH_LENGTH = 2.0e-5   # softplus 接触切换平滑长度，m。
 DIRECTION_EPSILON = 1.0e-6       # 圆弧中心线上平滑符号函数的正则化长度，m。
 
 # --- 隐式动力学松弛与每个载荷步的平衡判据 ---
-DT = 5.0e-3                      # 隐式 Euler 时间步，s；只用于加载步内部的动态松弛。
+DT = 0.01                      # 隐式 Euler 时间步，s；只用于加载步内部的动态松弛。
 MAX_NEWTON_ITERS = 35            # 每一个隐式时间步允许的最大 Newton 迭代次数。
 NEWTON_RESIDUAL_TOL = 1.0e-7     # 单个隐式步 Newton 力残差收敛阈值，N。
 NEWTON_STEP_TOL = 1.0e-10        # Newton 位移修正量阈值，m。
@@ -81,7 +83,7 @@ KP_CONTACT_MAX_FACTOR = 8.0             # 有效 Kp 不超过用户初始 Kp 的
 
 # --- 末端位移控制：方向在命令行通过 tip-direction-x/y 指定，默认 (0,-1) ---
 TIP_TOTAL_DISPLACEMENT = 120.0e-3 # 最后节点总位移大小，m。
-NUM_LOAD_STEPS = 40              # 总位移分成的载荷步数。
+NUM_LOAD_STEPS = 20              # 总位移分成的载荷步数。
 TIP_RAMP_STEPS = 25              # 每个载荷步中用平滑 S 曲线施加位移的隐式步数。
 
 # --- 初始随机扰动：在自由内部节点沿局部圆弧法向施加正/负短时脉冲 ---
@@ -90,6 +92,7 @@ PULSE_COUNT_MAX = 8              # 每次运行随机抽取脉冲节点数的上
 PULSE_FORCE_MIN = 2.0e-2         # 每个脉冲力幅值下限，N。
 PULSE_FORCE_MAX = 7.0e-2         # 每个脉冲力幅值上限，N。
 PULSE_DURATION = 2.0e-2          # 脉冲持续时间，s；此阶段末端固定在初始圆弧终点。
+FINAL_PERTURBATION_CONFIGURATION_THRESHOLD = 1.0e-4  # 诊断后构型改变判定阈值，m。
 
 # --- 导丝自然曲率 ---
 # 本算例模拟“原本笔直的导丝被装入圆弧管道”。因此自然曲率严格取 κ0=0，
@@ -116,8 +119,12 @@ class NewtonInfo:
     line_search_failures: int
 
 
-def resolve_device(name: str) -> torch.device:
+def resolve_device(name: str, backend: str = "python") -> torch.device:
     """将 --device 的文字参数解析为 PyTorch 设备；auto 优先使用 CUDA。"""
+    if backend == "cpp":
+        if name == "cuda":
+            raise RuntimeError("--backend cpp is CPU-only; use --device cpu or --device auto")
+        return torch.device("cpu")
     if name == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if name == "cuda" and not torch.cuda.is_available():
@@ -210,6 +217,23 @@ def circle_normal_numpy(points: np.ndarray, radius: float) -> np.ndarray:
     return rel / np.maximum(norm, 1.0e-14)
 
 
+def make_scaled_normal_pulse(
+    args: argparse.Namespace, positions: np.ndarray, seed: int | None, scale: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """构造可复现的局部法向短脉冲，并将幅值统一乘以 ``scale``。"""
+    rng = np.random.default_rng(seed)
+    candidates = np.arange(2, args.num_nodes - 1, dtype=int)  # 不影响固定端和位移端。
+    count = int(rng.integers(args.pulse_count_min, args.pulse_count_max + 1))
+    nodes = np.sort(rng.choice(candidates, size=count, replace=False))
+    signs = rng.choice(np.array([-1.0, 1.0]), size=count)
+    base_magnitudes = rng.uniform(args.pulse_force_min, args.pulse_force_max, size=count)
+    magnitudes = scale * base_magnitudes
+    directions = signs[:, None] * circle_normal_numpy(positions[nodes], args.arc_radius)
+    profile = np.zeros_like(positions)
+    profile[nodes] = magnitudes[:, None] * directions
+    return nodes, base_magnitudes, magnitudes, directions, profile
+
+
 def make_random_normal_pulses(args: argparse.Namespace, initial_positions: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """随机构造局部法向短脉冲，而不改变初始圆弧几何。
 
@@ -217,16 +241,22 @@ def make_random_normal_pulses(args: argparse.Namespace, initial_positions: np.nd
     节点 2 至 num_nodes-2。每个脉冲的正负号独立随机：正向指向外圆壁，
     负向指向内圆壁。指定 --pulse-seed 后可完全复现实验。
     """
-    rng = np.random.default_rng(args.pulse_seed)
-    candidates = np.arange(2, args.num_nodes - 1, dtype=int)  # 不影响固定端和位移端。
-    count = int(rng.integers(args.pulse_count_min, args.pulse_count_max + 1))
-    nodes = np.sort(rng.choice(candidates, size=count, replace=False))
-    signs = rng.choice(np.array([-1.0, 1.0]), size=count)
-    magnitudes = rng.uniform(args.pulse_force_min, args.pulse_force_max, size=count)
-    directions = signs[:, None] * circle_normal_numpy(initial_positions[nodes], args.arc_radius)
-    profile = np.zeros_like(initial_positions)
-    profile[nodes] = magnitudes[:, None] * directions
+    nodes, _base_magnitudes, magnitudes, directions, profile = make_scaled_normal_pulse(
+        args, initial_positions, args.pulse_seed, 1.0,
+    )
     return nodes, magnitudes, directions, profile
+
+
+def make_final_perturbation_pulse(args: argparse.Namespace, final_positions: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """生成终态诊断脉冲；固定种子决定节点、方向及未缩放基准幅值。"""
+    return make_scaled_normal_pulse(
+        args, final_positions, args.final_perturbation_seed, args.final_perturbation_scale,
+    )
+
+
+def classify_final_perturbation_configuration_change(settled: bool, max_position_difference: float) -> bool:
+    """只有已平衡且最大节点位移严格越过阈值时，才报告构型改变。"""
+    return bool(settled and max_position_difference > FINAL_PERTURBATION_CONFIGURATION_THRESHOLD)
 
 
 def discrete_curvature(positions: torch.Tensor) -> torch.Tensor:
@@ -598,7 +628,7 @@ def prescribed_state(initial: torch.Tensor, tip_displacement: float, constrained
     return mask, values
 
 
-def implicit_euler_step(
+def _implicit_euler_step_python(
     old_p: torch.Tensor, old_v: torch.Tensor, rest: torch.Tensor, reference_curvature: torch.Tensor, masses: torch.Tensor,
     old_integrals: torch.Tensor, previous_errors: torch.Tensor, pulse: torch.Tensor,
     mask: torch.Tensor, prescribed: torch.Tensor, args: argparse.Namespace, dt: float,
@@ -649,6 +679,113 @@ def implicit_euler_step(
     return p_new, v_new, integrals.detach(), force.detach(), active.detach(), weight.detach(), errors.detach(), NewtonInfo(converged, iteration, residual_norm, step_norm, failures)
 
 
+def _cpp_array(value: torch.Tensor, name: str) -> np.ndarray:
+    """Expose the script's strict CPU float64 arrays to the Arc2D pybind facade."""
+    if value.device.type != "cpu":
+        raise ValueError(f"{name} must be on CPU for --backend cpp")
+    if value.dtype != DTYPE:
+        raise TypeError(f"{name} must have dtype torch.float64 for --backend cpp")
+    return np.ascontiguousarray(value.detach().numpy(), dtype=np.float64)
+
+
+def initialize_arc2d_backend(args: argparse.Namespace, rest: torch.Tensor, masses: torch.Tensor) -> None:
+    """Build the immutable Arc2D C++ core once after geometry has been finalized."""
+    if getattr(args, "backend", "python") != "cpp":
+        args._arc2d_cpp_core = None
+        return
+    if args.torch_device.type != "cpu":
+        raise RuntimeError("--backend cpp requires a CPU torch device")
+    args._arc2d_cpp_core = der_cpp_backend.Arc2DCore(
+        _cpp_array(rest, "rest_lengths"),
+        _cpp_array(masses, "masses"),
+        args.EA,
+        args.EI,
+        args.damping,
+        args.arc_radius,
+        args.tube_half_width,
+        args.safe_distance,
+        args.Kp,
+        args.Ki,
+        args.max_pi_force,
+        args.max_integral_state,
+        args.integral_leak_rate,
+        args.contact_smooth_length,
+        args.direction_epsilon,
+    )
+
+
+def _implicit_euler_step_cpp(
+    old_p: torch.Tensor, old_v: torch.Tensor, rest: torch.Tensor, reference_curvature: torch.Tensor, masses: torch.Tensor,
+    old_integrals: torch.Tensor, previous_errors: torch.Tensor, pulse: torch.Tensor,
+    mask: torch.Tensor, prescribed: torch.Tensor, args: argparse.Namespace, dt: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, NewtonInfo]:
+    """Run the one cached Arc2D C++ core step and restore the torch-facing API."""
+    core = getattr(args, "_arc2d_cpp_core", None)
+    if core is None:
+        raise RuntimeError("Arc2D C++ backend is not initialized; call initialize_arc2d_backend before stepping")
+    if mask.shape != old_p.shape or mask.dtype != torch.bool:
+        raise ValueError("Arc2D C++ backend requires a boolean prescribed mask matching positions")
+    tip_constrained = bool(torch.all(mask[-1]).item())
+    expected_mask = torch.zeros_like(mask, dtype=torch.bool)
+    expected_mask[:2] = True
+    if tip_constrained:
+        expected_mask[-1] = True
+    if not torch.equal(mask, expected_mask):
+        raise ValueError("Arc2D C++ backend supports only nodes 0/1 and optional final-node constraints")
+    result = core.implicit_euler_step_cached(
+        _cpp_array(old_p, "positions"),
+        _cpp_array(old_v, "velocities"),
+        _cpp_array(old_integrals, "integrals"),
+        _cpp_array(previous_errors, "previous_errors"),
+        _cpp_array(prescribed, "prescribed"),
+        _cpp_array(pulse, "pulse_forces"),
+        _cpp_array(reference_curvature, "reference_curvature"),
+        tip_constrained,
+        dt,
+        args.max_newton_iters,
+        args.residual_tol,
+        args.step_tol,
+        getattr(args, "kp_active", args.Kp),
+        getattr(args, "ki_active", args.Ki),
+    )
+
+    def as_tensor(value: object, dtype: torch.dtype) -> torch.Tensor:
+        return torch.as_tensor(np.asarray(value), dtype=dtype, device=old_p.device).clone()
+
+    positions = as_tensor(result["positions"], DTYPE)
+    velocities = as_tensor(result["velocities"], DTYPE)
+    integrals = as_tensor(result["integrals"], DTYPE)
+    force = as_tensor(result["contact_force"], DTYPE)
+    active = as_tensor(result["contact_active"], torch.bool)
+    weight = as_tensor(result["contact_weight"], DTYPE)
+    errors = as_tensor(result["previous_errors"], DTYPE)
+    info = NewtonInfo(
+        bool(result["converged"]),
+        int(result["iterations"]),
+        float(result["residual_norm"]),
+        float(result["step_norm"]),
+        int(result["line_search_failures"]),
+    )
+    return positions, velocities, integrals, force, active, weight, errors, info
+
+
+def implicit_euler_step(
+    old_p: torch.Tensor, old_v: torch.Tensor, rest: torch.Tensor, reference_curvature: torch.Tensor, masses: torch.Tensor,
+    old_integrals: torch.Tensor, previous_errors: torch.Tensor, pulse: torch.Tensor,
+    mask: torch.Tensor, prescribed: torch.Tensor, args: argparse.Namespace, dt: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, NewtonInfo]:
+    """Backend-independent Arc2D implicit step used by every simulation phase."""
+    if getattr(args, "backend", "python") == "cpp":
+        return _implicit_euler_step_cpp(
+            old_p, old_v, rest, reference_curvature, masses, old_integrals,
+            previous_errors, pulse, mask, prescribed, args, dt,
+        )
+    return _implicit_euler_step_python(
+        old_p, old_v, rest, reference_curvature, masses, old_integrals,
+        previous_errors, pulse, mask, prescribed, args, dt,
+    )
+
+
 def check_equilibrium(velocities: torch.Tensor, mask: torch.Tensor, info: NewtonInfo, errors: torch.Tensor, args: argparse.Namespace, prior: int) -> tuple[bool, float, float, int]:
     """检查自由节点速度、Newton 残差、保护层误差是否连续满足平衡条件。"""
     free_nodes = torch.any(~mask, dim=1)
@@ -659,25 +796,321 @@ def check_equilibrium(velocities: torch.Tensor, mask: torch.Tensor, info: Newton
     return count >= args.settle_confirm_steps, speed, protection, count
 
 
-def append_state(history: dict[str, list], p: torch.Tensor, v: torch.Tensor, pi: torch.Tensor, integ: torch.Tensor, active: torch.Tensor, info: NewtonInfo, load_step: int, displacement: float, time_value: float, errors: torch.Tensor) -> None:
+def append_state(history: dict[str, list], p: torch.Tensor, v: torch.Tensor, pi: torch.Tensor, integ: torch.Tensor, active: torch.Tensor, info: NewtonInfo, load_step: int, displacement: float, time_value: float, protection_errors: torch.Tensor, previous_errors: torch.Tensor, phase: str = "load_relax") -> None:
     """向 NPZ 历史字典写入一个完整状态帧，供后处理与绘图复现。"""
     history["time"].append(time_value)
+    history["phase"].append(phase)
     history["load_step"].append(load_step)
     history["tip_displacement"].append(displacement)
     history["positions"].append(p.cpu().numpy().copy())
     history["velocities"].append(v.cpu().numpy().copy())
     history["pi_forces"].append(pi.cpu().numpy().copy())
     history["pi_integrals"].append(integ.cpu().numpy().copy())
+    history["previous_errors"].append(previous_errors.cpu().numpy().copy())
     history["contact_active"].append(active.cpu().numpy().copy())
-    history["max_protection_error"].append(float(errors.max().item()))
+    history["max_protection_error"].append(float(protection_errors.max().item()))
     history["max_pi_force"].append(float(torch.linalg.vector_norm(pi, dim=1).max().item()))
+    history["newton_converged"].append(info.converged)
     history["newton_iterations"].append(info.iterations)
     history["newton_residual"].append(info.residual_norm)
+    history["newton_step_norm"].append(info.step_norm)
+    history["newton_line_search_failures"].append(info.line_search_failures)
+
+
+def summarize_contact_segments(active: np.ndarray, pi_forces: np.ndarray) -> dict[str, np.ndarray]:
+    """Summarize contiguous active 2-D contact-node runs without assigning PI work an energy."""
+    active = np.asarray(active, dtype=bool)
+    pi_forces = np.asarray(pi_forces, dtype=np.float64)
+    if active.ndim != 1 or pi_forces.shape != (len(active), 2):
+        raise ValueError("active must be (N,) and pi_forces must be (N, 2)")
+    starts: list[int] = []
+    ends: list[int] = []
+    counts: list[int] = []
+    resultants: list[np.ndarray] = []
+    magnitude_sums: list[float] = []
+    index = 0
+    while index < len(active):
+        if not active[index]:
+            index += 1
+            continue
+        start = index
+        while index + 1 < len(active) and active[index + 1]:
+            index += 1
+        end = index
+        forces = pi_forces[start:end + 1]
+        starts.append(start); ends.append(end); counts.append(end - start + 1)
+        resultants.append(forces.sum(axis=0))
+        magnitude_sums.append(float(np.linalg.norm(forces, axis=1).sum()))
+        index += 1
+    return {
+        "start_nodes": np.asarray(starts, dtype=int),
+        "end_nodes": np.asarray(ends, dtype=int),
+        "counts": np.asarray(counts, dtype=int),
+        "resultants": np.asarray(resultants, dtype=np.float64).reshape(-1, 2),
+        "force_magnitude_sums": np.asarray(magnitude_sums, dtype=np.float64),
+    }
+
+
+def add_contact_summary_fields(record: dict[str, np.ndarray], prefix: str, active: torch.Tensor, pi: torch.Tensor) -> None:
+    """Persist a compact, schema-stable contact summary for an accepted state."""
+    summary = summarize_contact_segments(active.detach().cpu().numpy(), pi.detach().cpu().numpy())
+    record.update({f"{prefix}_contact_segment_{name}": values for name, values in summary.items()})
+    record[f"{prefix}_contact_total_force_magnitude_sum"] = np.asarray(float(summary["force_magnitude_sums"].sum()))
+    record[f"{prefix}_contact_net_resultant"] = np.asarray(
+        summary["resultants"].sum(axis=0) if len(summary["resultants"]) else np.zeros(2, dtype=np.float64),
+    )
+
+
+def print_contact_segment_summary(label: str, record: dict[str, np.ndarray], prefix: str) -> None:
+    """Print the persisted 2-D contact segmentation; PI forces are not potential energy."""
+    starts = np.asarray(record[f"{prefix}_contact_segment_start_nodes"])
+    ends = np.asarray(record[f"{prefix}_contact_segment_end_nodes"])
+    counts = np.asarray(record[f"{prefix}_contact_segment_counts"])
+    resultants = np.asarray(record[f"{prefix}_contact_segment_resultants"])
+    magnitude_sums = np.asarray(record[f"{prefix}_contact_segment_force_magnitude_sums"])
+    print(f"{label} CONTACT-SEGMENT FORCE SUMMARY (node-wise PI force sums; non-conservative)")
+    for segment_number, (start, end, count, resultant, magnitude_sum) in enumerate(zip(starts, ends, counts, resultants, magnitude_sums), start=1):
+        print(
+            f"  segment {segment_number}: nodes {int(start)}-{int(end)} ({int(count)} nodes), "
+            f"sum|F_PI|={float(magnitude_sum):.6e} N, "
+            f"resultant=({float(resultant[0]):.6e}, {float(resultant[1]):.6e}) N, "
+            f"|resultant|={float(np.linalg.norm(resultant)):.6e} N"
+        )
+    if not len(starts):
+        print("  no protection-layer contact nodes at this state")
+    total_magnitude = float(np.asarray(record[f"{prefix}_contact_total_force_magnitude_sum"]).item())
+    net = np.asarray(record[f"{prefix}_contact_net_resultant"], dtype=np.float64)
+    print(
+        f"  total sum|F_PI|={total_magnitude:.6e} N, "
+        f"net resultant=({float(net[0]):.6e}, {float(net[1]):.6e}) N"
+    )
 
 
 def snapshot_state(p: torch.Tensor, v: torch.Tensor, integrals: torch.Tensor, previous_errors: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """保存一个已接受平衡态；失败子步会从此状态无损回滚。"""
     return p.clone(), v.clone(), integrals.clone(), previous_errors.clone()
+
+
+def make_final_perturbation_diagnostic_record(
+    state: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    baseline_energies: tuple[float, float, float], args: argparse.Namespace,
+) -> dict[str, np.ndarray]:
+    """建立未执行或失败终态诊断的可保存记录，不改变主状态。"""
+    baseline_p, baseline_v, baseline_integrals, baseline_previous_errors = snapshot_state(*state)
+    empty_nodes = np.empty(0, dtype=int)
+    empty_values = np.empty(0, dtype=np.float64)
+    baseline_positions = baseline_p.cpu().numpy().copy()
+    return {
+        "final_perturbation_enabled": np.asarray(args.final_perturbation_scale > 0.0),
+        "final_perturbation_scale": np.asarray(args.final_perturbation_scale),
+        "final_perturbation_seed": np.asarray(args.final_perturbation_seed),
+        "final_perturbation_pulse_nodes": empty_nodes,
+        "final_perturbation_pulse_base_magnitudes": empty_values,
+        "final_perturbation_pulse_magnitudes": empty_values,
+        "final_perturbation_pulse_directions": np.empty((0, 2), dtype=np.float64),
+        "final_perturbation_pulse_profile": np.zeros_like(baseline_positions),
+        "final_perturbation_baseline_positions": baseline_positions,
+        "final_perturbation_baseline_velocities": baseline_v.cpu().numpy().copy(),
+        "final_perturbation_baseline_pi_integrals": baseline_integrals.cpu().numpy().copy(),
+        "final_perturbation_baseline_previous_errors": baseline_previous_errors.cpu().numpy().copy(),
+        "final_perturbation_post_positions": np.full_like(baseline_positions, np.nan),
+        "final_perturbation_post_velocities": np.full_like(baseline_v.cpu().numpy(), np.nan),
+        "final_perturbation_post_pi_integrals": np.full_like(baseline_integrals.cpu().numpy(), np.nan),
+        "final_perturbation_post_previous_errors": np.full_like(baseline_previous_errors.cpu().numpy(), np.nan),
+        "final_perturbation_post_settled": np.asarray(False),
+        "final_perturbation_post_max_speed": np.asarray(math.nan),
+        "final_perturbation_post_residual": np.asarray(math.nan),
+        "final_perturbation_post_protection_error": np.asarray(math.nan),
+        "final_perturbation_rms_position_difference": np.asarray(math.nan),
+        "final_perturbation_max_position_difference": np.asarray(math.nan),
+        "final_perturbation_configuration_changed": np.asarray(False),
+        "final_perturbation_failed": np.asarray(False),
+        "final_perturbation_failure_reason": np.asarray(""),
+        "final_perturbation_history_records": [],
+        "final_perturbation_baseline_elastic_stretch_energy_j": np.asarray(baseline_energies[0]),
+        "final_perturbation_baseline_elastic_bend_energy_j": np.asarray(baseline_energies[1]),
+        "final_perturbation_baseline_elastic_energy_j": np.asarray(baseline_energies[2]),
+        "final_perturbation_post_elastic_stretch_energy_j": np.asarray(math.nan),
+        "final_perturbation_post_elastic_bend_energy_j": np.asarray(math.nan),
+        "final_perturbation_post_elastic_energy_j": np.asarray(math.nan),
+        "final_perturbation_delta_elastic_stretch_energy_j": np.asarray(math.nan),
+        "final_perturbation_delta_elastic_bend_energy_j": np.asarray(math.nan),
+        "final_perturbation_delta_elastic_energy_j": np.asarray(math.nan),
+        "final_perturbation_baseline_contact_segment_start_nodes": empty_nodes,
+        "final_perturbation_baseline_contact_segment_end_nodes": empty_nodes,
+        "final_perturbation_baseline_contact_segment_counts": empty_nodes,
+        "final_perturbation_baseline_contact_segment_resultants": np.empty((0, 2), dtype=np.float64),
+        "final_perturbation_baseline_contact_segment_force_magnitude_sums": empty_values,
+        "final_perturbation_baseline_contact_total_force_magnitude_sum": np.asarray(math.nan),
+        "final_perturbation_baseline_contact_net_resultant": np.full(2, math.nan),
+        "final_perturbation_post_contact_segment_start_nodes": empty_nodes,
+        "final_perturbation_post_contact_segment_end_nodes": empty_nodes,
+        "final_perturbation_post_contact_segment_counts": empty_nodes,
+        "final_perturbation_post_contact_segment_resultants": np.empty((0, 2), dtype=np.float64),
+        "final_perturbation_post_contact_segment_force_magnitude_sums": empty_values,
+        "final_perturbation_post_contact_total_force_magnitude_sum": np.asarray(math.nan),
+        "final_perturbation_post_contact_net_resultant": np.full(2, math.nan),
+    }
+
+
+def run_final_perturbation_diagnostic(
+    state: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], initial: torch.Tensor,
+    rest: torch.Tensor, reference_curvature: torch.Tensor, masses: torch.Tensor, direction: torch.Tensor,
+    baseline_energies: tuple[float, float, float], args: argparse.Namespace,
+    history_start_time: float = 0.0, history_load_step: int = -1,
+) -> dict[str, np.ndarray]:
+    """在已接受终态上做一次独立脉冲诊断，绝不替换主仿真的终态。"""
+    diagnostic = make_final_perturbation_diagnostic_record(state, baseline_energies, args)
+    records: list[tuple] = []
+
+    def fail_diagnostic(error: Exception) -> dict[str, np.ndarray]:
+        """Retain every already-completed diagnostic frame when later diagnostics fail."""
+        diagnostic["final_perturbation_history_records"] = records
+        diagnostic["final_perturbation_failed"] = np.asarray(True)
+        diagnostic["final_perturbation_failure_reason"] = np.asarray(f"{type(error).__name__}: {error}")
+        diagnostic["final_perturbation_post_settled"] = np.asarray(False)
+        diagnostic["final_perturbation_configuration_changed"] = np.asarray(False)
+        for key in (
+            "final_perturbation_post_elastic_stretch_energy_j",
+            "final_perturbation_post_elastic_bend_energy_j",
+            "final_perturbation_post_elastic_energy_j",
+            "final_perturbation_delta_elastic_stretch_energy_j",
+            "final_perturbation_delta_elastic_bend_energy_j",
+            "final_perturbation_delta_elastic_energy_j",
+        ):
+            diagnostic[key] = np.asarray(math.nan)
+        return diagnostic
+
+    baseline_positions = diagnostic["final_perturbation_baseline_positions"]
+    try:
+        p, v, integrals, previous_errors = snapshot_state(*state)
+        baseline_pi, _baseline_integrals, baseline_active, _baseline_weight, _baseline_errors, _baseline_clearance = contact_quantities(
+            p, integrals, previous_errors, args, args.dt,
+        )
+        add_contact_summary_fields(diagnostic, "final_perturbation_baseline", baseline_active, baseline_pi)
+    except Exception as error:
+        return fail_diagnostic(error)
+    if args.final_perturbation_scale == 0.0:
+        return diagnostic
+
+    try:
+        nodes, base_magnitudes, magnitudes, directions, pulse_np = make_final_perturbation_pulse(args, baseline_positions)
+    except Exception as error:
+        return fail_diagnostic(error)
+    diagnostic.update({
+        "final_perturbation_pulse_nodes": nodes,
+        "final_perturbation_pulse_base_magnitudes": base_magnitudes,
+        "final_perturbation_pulse_magnitudes": magnitudes,
+        "final_perturbation_pulse_directions": directions,
+        "final_perturbation_pulse_profile": pulse_np,
+    })
+    pulse = torch.as_tensor(pulse_np, dtype=DTYPE, device=p.device)
+    mask, values = prescribed_state(initial, args.tip_total_displacement, True, direction, args)
+    finite = True
+    last_speed, last_residual, last_protection = math.inf, math.inf, math.inf
+    pulse_elapsed = 0.0
+    history_time = history_start_time
+    print(
+        "[PERTURB PULSE] "
+        f"seed={args.final_perturbation_seed}, scale={args.final_perturbation_scale:g}, "
+        f"duration={args.pulse_duration:.6g} s, nodes={nodes.tolist()}, "
+        f"base_N={np.round(base_magnitudes, 6).tolist()}, actual_N={np.round(magnitudes, 6).tolist()}, "
+        f"directions={np.round(directions, 6).tolist()}"
+    )
+    pulse_step = 0
+    while pulse_elapsed < args.pulse_duration - 1.0e-14:
+        step = min(args.dt, args.pulse_duration - pulse_elapsed)
+        try:
+            p, v, integrals, pi, active, _weight, previous_errors, info = implicit_euler_step(
+                p, v, rest, reference_curvature, masses, integrals, previous_errors, pulse, mask, values, args, step,
+            )
+        except Exception as error:
+            return fail_diagnostic(error)
+        pulse_elapsed += step
+        history_time += step
+        pulse_step += 1
+        errors = geometric_protection_error(p, args)
+        records.append((p, v, pi, integrals, active, info, history_load_step, args.tip_total_displacement, history_time, errors, previous_errors, "final_perturb_pulse"))
+        if pulse_step % 20 == 0 or pulse_elapsed >= args.pulse_duration - 1.0e-14:
+            print(f"  [PERTURB PULSE] step={pulse_step}, t={pulse_elapsed:.6g} s, residual={info.residual_norm:.3e} N")
+        finite = bool(torch.isfinite(p).all() and torch.isfinite(v).all() and torch.isfinite(integrals).all() and math.isfinite(info.residual_norm))
+        if not finite:
+            last_residual = info.residual_norm
+            break
+
+    settled = False
+    stable_count = 0
+    if finite:
+        for _relax in range(1, args.max_settle_steps + 1):
+            try:
+                p, v, integrals, pi, active, _weight, previous_errors, info = implicit_euler_step(
+                    p, v, rest, reference_curvature, masses, integrals, previous_errors,
+                    torch.zeros_like(p), mask, values, args, args.dt,
+                )
+            except Exception as error:
+                return fail_diagnostic(error)
+            history_time += args.dt
+            errors = geometric_protection_error(p, args)
+            records.append((p, v, pi, integrals, active, info, history_load_step, args.tip_total_displacement, history_time, errors, previous_errors, "final_perturb_relax"))
+            finite = bool(torch.isfinite(p).all() and torch.isfinite(v).all() and torch.isfinite(integrals).all() and math.isfinite(info.residual_norm))
+            if not finite:
+                last_residual = info.residual_norm
+                break
+            settled, last_speed, last_protection, stable_count = check_equilibrium(v, mask, info, errors, args, stable_count)
+            last_residual = info.residual_norm
+            if _relax % 20 == 0 or settled or _relax == args.max_settle_steps:
+                print(
+                    f"  [PERTURB RELAX] step={_relax}, speed={last_speed:.2e} m/s, "
+                    f"residual={last_residual:.2e} N, protection={last_protection * 1e3:.4f} mm"
+                )
+            if settled:
+                break
+
+    diagnostic["final_perturbation_post_max_speed"] = np.asarray(last_speed)
+    diagnostic["final_perturbation_post_residual"] = np.asarray(last_residual)
+    diagnostic["final_perturbation_post_protection_error"] = np.asarray(last_protection)
+    diagnostic["final_perturbation_post_settled"] = np.asarray(settled)
+    diagnostic["final_perturbation_history_records"] = records
+    if not settled:
+        diagnostic["final_perturbation_failed"] = np.asarray(True)
+        diagnostic["final_perturbation_failure_reason"] = np.asarray(
+            "non-finite diagnostic state" if not finite else f"did not settle in {args.max_settle_steps} relaxation steps",
+        )
+    if finite:
+        try:
+            post_positions = p.cpu().numpy().copy()
+            differences = np.linalg.norm(post_positions - baseline_positions, axis=1)
+            rms_difference = float(np.sqrt(np.mean(differences**2)))
+            max_difference = float(np.max(differences))
+            post_stretch, post_bend, post_total = elastic_energy(p, rest, args.EA, args.EI, reference_curvature)
+        except Exception as error:
+            return fail_diagnostic(error)
+        diagnostic.update({
+            "final_perturbation_post_positions": post_positions,
+            "final_perturbation_post_velocities": v.cpu().numpy().copy(),
+            "final_perturbation_post_pi_integrals": integrals.cpu().numpy().copy(),
+            "final_perturbation_post_previous_errors": previous_errors.cpu().numpy().copy(),
+            "final_perturbation_rms_position_difference": np.asarray(rms_difference),
+            "final_perturbation_max_position_difference": np.asarray(max_difference),
+            "final_perturbation_configuration_changed": np.asarray(
+                classify_final_perturbation_configuration_change(settled, max_difference),
+            ),
+        })
+        if settled:
+            post_stretch_value, post_bend_value, post_total_value = (float(post_stretch.item()), float(post_bend.item()), float(post_total.item()))
+            diagnostic.update({
+                "final_perturbation_post_elastic_stretch_energy_j": np.asarray(post_stretch_value),
+                "final_perturbation_post_elastic_bend_energy_j": np.asarray(post_bend_value),
+                "final_perturbation_post_elastic_energy_j": np.asarray(post_total_value),
+                "final_perturbation_delta_elastic_stretch_energy_j": np.asarray(post_stretch_value - baseline_energies[0]),
+                "final_perturbation_delta_elastic_bend_energy_j": np.asarray(post_bend_value - baseline_energies[1]),
+                "final_perturbation_delta_elastic_energy_j": np.asarray(post_total_value - baseline_energies[2]),
+            })
+            try:
+                add_contact_summary_fields(diagnostic, "final_perturbation_post", active, pi)
+            except Exception as error:
+                return fail_diagnostic(error)
+    return diagnostic
 
 
 def try_load_increment(
@@ -708,7 +1141,7 @@ def try_load_increment(
             )
             time_value += args.dt
             errors = geometric_protection_error(p, args)
-            staged.append((p, v, pi, integrals, active, info, load_step, displacement, time_value, errors))
+            staged.append((p, v, pi, integrals, active, info, load_step, displacement, time_value, errors, previous_errors, "load_ramp"))
             # Ramp 阶段是有意施加位移的瞬态过程，单个隐式步 Newton 未达到
             # 严格容限并不等于载荷步失败；只在数值非有限时立刻回滚，随后由
             # 持位松弛阶段的平衡判据决定该子步是否真正接受。
@@ -726,7 +1159,7 @@ def try_load_increment(
             settled, speed, protection, stable_count = check_equilibrium(v, mask, info, errors, args, stable_count)
             last.update(speed=speed, protection=protection, residual=info.residual_norm, relax=relax)
             if relax % args.history_save_interval == 0 or settled:
-                staged.append((p, v, pi, integrals, active, info, load_step, sub_end, time_value, errors))
+                staged.append((p, v, pi, integrals, active, info, load_step, sub_end, time_value, errors, previous_errors, "load_relax"))
             if settled:
                 break
         else:
@@ -766,7 +1199,7 @@ def prebalance_zero_displacement(
         )
         last_residual = info.residual_norm
         if relax % args.history_save_interval == 0 or settled:
-            append_state(history, p, v, pi, integrals, active, info, -1, 0.0, time_value, errors)
+            append_state(history, p, v, pi, integrals, active, info, -1, 0.0, time_value, errors, previous_errors, "prebalance")
         if settled:
             print(
                 f"  settled; relax={relax}, speed={last_speed:.2e} m/s, "
@@ -793,6 +1226,7 @@ def run_simulation(args: argparse.Namespace) -> dict[str, np.ndarray]:
     # 所有内节点 κ0=0，从而初始圆弧有弯曲势能和恢复力。
     reference_curvature = torch.full((args.num_nodes - 2,), NATURAL_CURVATURE, dtype=DTYPE, device=device)
     masses = torch.as_tensor(np_mass, dtype=DTYPE, device=device)
+    initialize_arc2d_backend(args, rest, masses)
     integrals = torch.as_tensor(np_int, dtype=DTYPE, device=device)
     initial = p.clone()
     direction = torch.as_tensor(args.tip_direction, dtype=DTYPE, device=device)
@@ -803,13 +1237,14 @@ def run_simulation(args: argparse.Namespace) -> dict[str, np.ndarray]:
     args.kp_active = args.Kp  # 仅接触保护层误差超限时，自动提高而不改变 Ki。
     zero = torch.zeros_like(p)
     history: dict[str, list] = {key: [] for key in (
-        "time", "load_step", "tip_displacement", "positions", "velocities", "pi_forces", "pi_integrals", "contact_active", "max_protection_error", "max_pi_force", "newton_iterations", "newton_residual"
+        "time", "phase", "load_step", "tip_displacement", "positions", "velocities", "pi_forces", "pi_integrals", "previous_errors", "contact_active", "max_protection_error", "max_pi_force", "newton_converged", "newton_iterations", "newton_residual", "newton_step_norm", "newton_line_search_failures"
     )}
     initial_info = NewtonInfo(True, 0, 0.0, 0.0, 0)
-    append_state(history, p, v, zero, integrals, torch.zeros(args.num_nodes, dtype=torch.bool, device=device), initial_info, 0, 0.0, 0.0, previous_errors)
+    append_state(history, p, v, zero, integrals, torch.zeros(args.num_nodes, dtype=torch.bool, device=device), initial_info, 0, 0.0, 0.0, previous_errors, previous_errors, "initial")
     time_value = 0.0
-    print(f"2-D circular arc: R={args.arc_radius:.6g} m, angle={args.arc_angle_deg:g} deg, tube half-width={args.tube_half_width:.6g} m")
-    print(f"random normal pulses: seed={args.pulse_seed}, nodes={nodes.tolist()}, magnitudes_N={np.round(pulse_magnitudes, 6).tolist()}")
+    print("=== 2-D ARC GUIDEWIRE QUASI-STATIC RUN ===")
+    print(f"[CONFIG] backend={getattr(args, 'backend', 'python')}, dtype={DTYPE}, device={device}; R={args.arc_radius:.6g} m, angle={args.arc_angle_deg:g} deg, tube half-width={args.tube_half_width:.6g} m")
+    print(f"[INITIAL PULSE] seed={args.pulse_seed}, duration={args.pulse_duration:.6g} s, nodes={nodes.tolist()}, magnitudes_N={np.round(pulse_magnitudes, 6).tolist()}, directions={np.round(pulse_directions, 6).tolist()}")
 
     # 阶段 0：末端仍在初始位置，先释放“直杆被弯成圆弧”带来的恢复力。
     # 这一步结束后才生成可解释的零内缩起点；它不会修改导丝的总静息长度。
@@ -830,7 +1265,7 @@ def run_simulation(args: argparse.Namespace) -> dict[str, np.ndarray]:
         p, v, integrals, pi, active, _weight, previous_errors, info = implicit_euler_step(p, v, rest, reference_curvature, masses, integrals, previous_errors, pulse, mask, values, args, step)
         time_value += step
         pulse_elapsed += step
-        append_state(history, p, v, pi, integrals, active, info, 0, 0.0, time_value, geometric_protection_error(p, args))
+        append_state(history, p, v, pi, integrals, active, info, 0, 0.0, time_value, geometric_protection_error(p, args), previous_errors, "initial_pulse")
         if not info.converged:
             print(f"warning: pulse Newton step residual={info.residual_norm:.3e}")
 
@@ -901,6 +1336,27 @@ def run_simulation(args: argparse.Namespace) -> dict[str, np.ndarray]:
                     "Reduce --tip-total-displacement or increase --num-load-steps."
                 )
 
+    # 主结果在此刻已经是全部载荷步接受的终态。终态扰动仅在其克隆上运行，
+    # 因此无论诊断成功、未收敛或数值失败，都不影响下列主结果与 final_elastic_*。
+    stretch, bend, total = elastic_energy(p, rest, args.EA, args.EI, reference_curvature)
+    accepted_terminal_state = snapshot_state(p, v, integrals, previous_errors)
+    baseline_energies = (float(stretch.item()), float(bend.item()), float(total.item()))
+    try:
+        final_perturbation = run_final_perturbation_diagnostic(
+            accepted_terminal_state, initial, rest, reference_curvature, masses, direction, baseline_energies, args,
+            history_start_time=time_value, history_load_step=args.num_load_steps,
+        )
+    except Exception as error:
+        # 诊断是附加观测，不能让已接受并可保存的主试验因其内部异常而丢失。
+        final_perturbation = make_final_perturbation_diagnostic_record(
+            accepted_terminal_state, baseline_energies, args,
+        )
+        final_perturbation["final_perturbation_failed"] = np.asarray(True)
+        final_perturbation["final_perturbation_failure_reason"] = np.asarray(f"{type(error).__name__}: {error}")
+
+    for record in final_perturbation.pop("final_perturbation_history_records", []):
+        append_state(history, *record)
+
     result = {key: np.asarray(value) for key, value in history.items()}
     result.update({
         "initial_positions": np_p, "arc_radius": np.asarray(args.arc_radius), "arc_angle_deg": np.asarray(args.arc_angle_deg),
@@ -915,18 +1371,42 @@ def run_simulation(args: argparse.Namespace) -> dict[str, np.ndarray]:
         "initial_imperfection_mode_count": np.asarray(args.initial_imperfection_mode_count),
         "initial_imperfection_seed": np.asarray(-1 if args.initial_imperfection_seed is None else args.initial_imperfection_seed),
     })
-    stretch, bend, total = elastic_energy(p, rest, args.EA, args.EI, reference_curvature)
+    result.update(final_perturbation)
     result["final_elastic_stretch_energy_j"] = np.asarray(float(stretch.item()))
     result["final_elastic_bend_energy_j"] = np.asarray(float(bend.item()))
     result["final_elastic_energy_j"] = np.asarray(float(total.item()))
     prefix = Path(args.output_prefix)
     prefix.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(prefix.with_suffix(".npz"), **result)
-    print(f"history saved: {prefix.with_suffix('.npz')}")
-    print("FINAL GUIDEWIRE ELASTIC ENERGY (PI contact is non-conservative and is excluded)")
-    print(f"  stretching energy : {float(stretch.item()):.6e} J")
-    print(f"  bending energy    : {float(bend.item()):.6e} J")
-    print(f"  total elastic energy (stretch + bend): {float(total.item()):.6e} J")
+    print("[ENERGY BASELINE] PI contact is non-conservative and excluded from elastic energy")
+    print(f"  stretching={float(stretch.item()):.6e} J, bending={float(bend.item()):.6e} J, total={float(total.item()):.6e} J")
+    print_contact_segment_summary("BASELINE", final_perturbation, "final_perturbation_baseline")
+    if args.final_perturbation_scale == 0.0:
+        print("FINAL-STATE PERTURBATION: disabled (scale=0)")
+    elif bool(final_perturbation["final_perturbation_post_settled"].item()):
+        print_contact_segment_summary("POST STEADY", final_perturbation, "final_perturbation_post")
+        print("[ENERGY POST STEADY] PI contact is non-conservative and excluded from elastic energy")
+        print(
+            f"  stretching={float(final_perturbation['final_perturbation_post_elastic_stretch_energy_j'].item()):.6e} J, "
+            f"bending={float(final_perturbation['final_perturbation_post_elastic_bend_energy_j'].item()):.6e} J, "
+            f"total={float(final_perturbation['final_perturbation_post_elastic_energy_j'].item()):.6e} J, "
+            f"delta={float(final_perturbation['final_perturbation_delta_elastic_energy_j'].item()):+.6e} J"
+        )
+        print(
+            "FINAL-STATE PERTURBATION: settled; "
+            f"max difference={float(final_perturbation['final_perturbation_max_position_difference'].item()):.6e} m, "
+            f"configuration changed={bool(final_perturbation['final_perturbation_configuration_changed'].item())}"
+        )
+    else:
+        print(
+            "FINAL-STATE PERTURBATION: diagnostic failed to settle; primary final state preserved. "
+            f"last speed={float(final_perturbation['final_perturbation_post_max_speed'].item()):.3e} m/s, "
+            f"residual={float(final_perturbation['final_perturbation_post_residual'].item()):.3e} N"
+        )
+        if bool(final_perturbation["final_perturbation_failed"].item()):
+            print(f"  diagnostic reason: {final_perturbation['final_perturbation_failure_reason'].item()}")
+        print("[ENERGY POST STEADY] unavailable: final perturbation did not settle; attempted-state energy is not reported")
+    print(f"[OUTPUT] history saved: {prefix.with_suffix('.npz')}")
     return result
 
 
@@ -941,6 +1421,31 @@ def sample_boundaries(args: argparse.Namespace, count: int = 600) -> tuple[np.nd
     po = center + (args.arc_radius + args.tube_half_width - args.safe_distance) * radial
     pi = center + (args.arc_radius - args.tube_half_width + args.safe_distance) * radial
     return centerline, outer, inner, np.stack((po, pi))
+
+
+def final_energy_bar_data(
+    history: dict[str, np.ndarray],
+) -> tuple[tuple[str, str, str], tuple[float, float, float], tuple[float, float, float] | None]:
+    """Return the primary and, when valid, post-perturbation elastic energies for plotting."""
+    labels = ("stretch", "bend", "total")
+    primary = tuple(
+        float(np.asarray(history[key]).item())
+        for key in (
+            "final_elastic_stretch_energy_j",
+            "final_elastic_bend_energy_j",
+            "final_elastic_energy_j",
+        )
+    )
+    post_settled = bool(np.asarray(history.get("final_perturbation_post_settled", False)).item())
+    post = tuple(
+        float(np.asarray(history.get(key, np.nan)).item())
+        for key in (
+            "final_perturbation_post_elastic_stretch_energy_j",
+            "final_perturbation_post_elastic_bend_energy_j",
+            "final_perturbation_post_elastic_energy_j",
+        )
+    )
+    return labels, primary, post if post_settled and np.isfinite(post).all() else None
 
 
 def visualize_results(history: dict[str, np.ndarray], args: argparse.Namespace) -> None:
@@ -985,7 +1490,7 @@ def visualize_results(history: dict[str, np.ndarray], args: argparse.Namespace) 
             active = history["contact_active"][frame]
             contact_points.set_offsets(point_set[active] if np.any(active) else np.empty((0, 2)))
             title.set_text(
-                f"2-D arc guidewire | t={time_values[frame]:.3f} s | "
+                f"2-D arc guidewire | phase={history['phase'][frame]} | t={time_values[frame]:.3f} s | "
                 f"load step={history['load_step'][frame]} | tip displacement={history['tip_displacement'][frame] * 1e3:.3f} mm"
             )
             return rod_line, fixed_points, contact_points, title
@@ -999,8 +1504,13 @@ def visualize_results(history: dict[str, np.ndarray], args: argparse.Namespace) 
         plt.show()
         plt.close(figure)
 
+    phase = np.asarray(history.get("phase", np.full(len(positions), "primary")), dtype=str)
+    final_phases = np.isin(phase, ("final_perturb_pulse", "final_perturb_relax"))
+    primary_terminal_index = int(np.flatnonzero(~final_phases)[-1])
     bend_index = int(np.argmax(np.ptp(positions[:, :, 0], axis=1) + np.ptp(positions[:, :, 1], axis=1)))
-    fig, (ax, hist) = plt.subplots(2, 1, figsize=(9, 10))
+    fig, (ax, hist, energy_ax) = plt.subplots(
+        3, 1, figsize=(9, 13), gridspec_kw={"height_ratios": (2.2, 1.0, 1.0)},
+    )
     ax.plot(outer[:, 0], outer[:, 1], "k", lw=1.4, label="tube walls")
     ax.plot(inner[:, 0], inner[:, 1], "k", lw=1.4)
     ax.plot(protection[0, :, 0], protection[0, :, 1], color="tab:red", ls=":", lw=1.0, label="protection layer")
@@ -1008,12 +1518,21 @@ def visualize_results(history: dict[str, np.ndarray], args: argparse.Namespace) 
     ax.plot(centerline[:, 0], centerline[:, 1], color="0.75", ls="--", lw=1.0, label="centerline")
     ax.plot(positions[0, :, 0], positions[0, :, 1], "0.4", ls="--", label="initial")
     ax.plot(positions[bend_index, :, 0], positions[bend_index, :, 1], color="tab:orange", label="maximum span")
-    ax.plot(positions[-1, :, 0], positions[-1, :, 1], "b-o", ms=2.5, label="final")
-    ax.scatter(positions[-1, :2, 0], positions[-1, :2, 1], marker="s", color="red", label="fixed nodes", zorder=5)
-    contact = history["contact_active"][-1]
+    ax.plot(positions[primary_terminal_index, :, 0], positions[primary_terminal_index, :, 1], "b-o", ms=2.5, label="primary final")
+    post_settled = history.get("final_perturbation_post_settled")
+    post_positions = history.get("final_perturbation_post_positions")
+    if post_settled is not None and bool(np.asarray(post_settled).item()) and post_positions is not None:
+        post_positions = np.asarray(post_positions)
+        if post_positions.shape == positions[-1].shape and np.isfinite(post_positions).all():
+            ax.plot(
+                post_positions[:, 0], post_positions[:, 1], color="tab:purple", ls="--", marker=".", ms=3.0,
+                label="post final-state perturbation",
+            )
+    ax.scatter(positions[primary_terminal_index, :2, 0], positions[primary_terminal_index, :2, 1], marker="s", color="red", label="fixed nodes", zorder=5)
+    contact = history["contact_active"][primary_terminal_index]
     if np.any(contact):
-        ax.scatter(positions[-1, contact, 0], positions[-1, contact, 1], color="magenta", s=25, label="PI contact", zorder=6)
-    tip = positions[-1, -1]
+        ax.scatter(positions[primary_terminal_index, contact, 0], positions[primary_terminal_index, contact, 1], color="magenta", s=25, label="PI contact", zorder=6)
+    tip = positions[primary_terminal_index, -1]
     arrow = 0.12 * args.total_length * args.tip_direction  # 绿色箭头仅表示用户指定的固定加载方向。
     ax.arrow(tip[0], tip[1], arrow[0], arrow[1], color="green", width=0.0015, head_width=0.018, length_includes_head=True)
     ax.set_aspect("equal", adjustable="box")
@@ -1022,7 +1541,33 @@ def visualize_results(history: dict[str, np.ndarray], args: argparse.Namespace) 
     hist.plot(history["time"], history["max_protection_error"] * 1e3, label="max protection error (mm)")
     hist.plot(history["time"], history["max_pi_force"], label="max PI force (N)")
     hist.plot(history["time"], history["newton_iterations"], label="Newton iterations")
+    for phase_name, color, label in (
+        ("final_perturb_pulse", "tab:purple", "final perturb pulse"),
+        ("final_perturb_relax", "tab:green", "final perturb relax"),
+    ):
+        indices = np.flatnonzero(phase == phase_name)
+        if len(indices):
+            start = time_values[indices[0]]
+            end = time_values[indices[-1]]
+            if end <= start:
+                end = start + 0.25 * args.dt
+            hist.axvspan(start, end, color=color, alpha=0.12, label=label)
     hist.grid(alpha=0.25); hist.legend(); hist.set(xlabel="relaxation time (s)", title="Contact and solver history")
+
+    energy_labels, primary_energy, post_energy = final_energy_bar_data(history)
+    indices = np.arange(len(energy_labels))
+    width = 0.36
+    primary_bars = energy_ax.bar(indices - 0.5 * width, primary_energy, width, label="primary final", color="tab:blue")
+    energy_ax.bar_label(primary_bars, labels=[f"{value:.2e}" for value in primary_energy], padding=3, fontsize=8)
+    if post_energy is not None:
+        post_bars = energy_ax.bar(indices + 0.5 * width, post_energy, width, label="post perturbation steady", color="tab:purple")
+        energy_ax.bar_label(post_bars, labels=[f"{value:.2e}" for value in post_energy], padding=3, fontsize=8)
+    energy_ax.set_xticks(indices, energy_labels)
+    energy_ax.set_ylabel("elastic energy (J)")
+    energy_ax.set_title("Final elastic energy (PI contact is non-conservative)")
+    energy_ax.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
+    energy_ax.grid(axis="y", alpha=0.25)
+    energy_ax.legend(loc="best")
     fig.tight_layout(); plt.show()
 
 
@@ -1088,6 +1633,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pulse-duration", type=float, default=PULSE_DURATION)
     parser.add_argument("--pulse-seed", type=int, default=None, help="随机种子；省略则每次运行产生新扰动")
     parser.add_argument(
+        "--final-perturbation-scale", type=float, default=0.0,
+        help="终态诊断脉冲的幅值比例；0 表示跳过诊断",
+    )
+    parser.add_argument(
+        "--final-perturbation-seed", type=int, default=0,
+        help="终态诊断脉冲的独立随机种子",
+    )
+    parser.add_argument(
         "--initial-normal-imperfection-amplitude", type=float,
         default=INITIAL_NORMAL_IMPERFECTION_AMPLITUDE,
         help="作为自然预弯形状写入的随机法向几何缺陷最大幅值(m)；0 表示关闭",
@@ -1110,6 +1663,8 @@ def parse_args() -> argparse.Namespace:
                         help="在随机脉冲与压缩前，以零内缩、两端固定条件松弛直杆恢复力")
     parser.add_argument("--prebalance-max-steps", type=int, default=MAX_SETTLE_STEPS,
                         help="零内缩预平衡阶段允许的最大松弛步数")
+    parser.add_argument("--backend", choices=("cpp", "python"), default="cpp",
+                        help="单步隐式 Euler 后端；cpp 为 CPU float64 Arc2DCore，python 为 PyTorch 参考路径")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--output-prefix", default="2d_npz/rod_soft_contact_PI_quasi_static_2d_arc")
     parser.add_argument("--animation-stride", type=int, default=1, help="动画每隔多少保存帧显示一次；1 表示完整过程")
@@ -1135,6 +1690,8 @@ def parse_args() -> argparse.Namespace:
     if not 0.0 < args.arc_angle_rad < 2.0 * math.pi: parser.error("arc-angle-deg must lie between 0 and 360")
     if args.pulse_count_min < 1 or args.pulse_count_max < args.pulse_count_min or args.pulse_count_max > args.num_nodes - 3: parser.error("invalid pulse-count range")
     if args.pulse_force_min < 0 or args.pulse_force_max < args.pulse_force_min or args.pulse_duration < 0: parser.error("invalid pulse force/duration")
+    if not math.isfinite(args.final_perturbation_scale) or args.final_perturbation_scale < 0:
+        parser.error("final-perturbation-scale must be finite and non-negative")
     if args.initial_normal_imperfection_amplitude < 0 or args.initial_normal_imperfection_amplitude >= args.tube_half_width - args.safe_distance:
         parser.error("initial-normal-imperfection-amplitude must be non-negative and below the protection-layer boundary")
     if args.initial_imperfection_mode_count < 1:
@@ -1143,7 +1700,9 @@ def parse_args() -> argparse.Namespace:
         parser.error("arc-follow tip-total-displacement must be smaller than the initial arc length")
     _, args.EA, args.EI, args.damping = rod_properties(args.total_length, args.diameter, args.density)
     args.tip_displacement_step = args.tip_total_displacement / args.num_load_steps  # 每个载荷步的累计位移增量。
-    args.torch_device = resolve_device(args.device)
+    if args.backend == "cpp" and args.device == "cuda":
+        parser.error("--backend cpp is CPU-only; use --device cpu or --device auto")
+    args.torch_device = resolve_device(args.device, args.backend)
     return args
 
 
