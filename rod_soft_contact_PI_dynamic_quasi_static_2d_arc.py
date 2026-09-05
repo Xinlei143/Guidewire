@@ -45,7 +45,7 @@ DIAMETER = 1.0e-3                # 导丝直径，m。
 MATERIAL_DENSITY = 7850.0        # 钢的密度，kg/m^3。
 YOUNG_MODULUS = 200.0e9          # 杨氏模量，Pa。
 DAMPING_RATIO = 1.0              # 按等效刚度估计的临界阻尼比。
-NUM_NODES = 200                   # DER 节点数；越大越精细，但全局 Newton Jacobian 更耗时。
+NUM_NODES = 800                   # DER 节点数；越大越精细，但全局 Newton Jacobian 更耗时。
 
 # --- 圆弧管几何 ---
 ARC_ANGLE_DEG = 90.0             # 中心线圆弧转角，deg；90° 时起点切线水平、终点切线竖直。
@@ -63,7 +63,7 @@ CONTACT_SMOOTH_LENGTH = 2.0e-5   # softplus 接触切换平滑长度，m。
 DIRECTION_EPSILON = 1.0e-6       # 圆弧中心线上平滑符号函数的正则化长度，m。
 
 # --- 隐式动力学松弛与每个载荷步的平衡判据 ---
-DT = 0.01                      # 隐式 Euler 时间步，s；只用于加载步内部的动态松弛。
+DT = 0.005                      # 隐式 Euler 时间步，s；只用于加载步内部的动态松弛。
 MAX_NEWTON_ITERS = 35            # 每一个隐式时间步允许的最大 Newton 迭代次数。
 NEWTON_RESIDUAL_TOL = 1.0e-7     # 单个隐式步 Newton 力残差收敛阈值，N。
 NEWTON_STEP_TOL = 1.0e-10        # Newton 位移修正量阈值，m。
@@ -1450,7 +1450,8 @@ def final_energy_bar_data(
 
 def visualize_results(history: dict[str, np.ndarray], args: argparse.Namespace) -> None:
     """先播放完整变形动画，再显示初始/中间/最终构型与求解器历史。"""
-    if not args.show:
+    summary_figure_output = getattr(args, "summary_figure_output", None)
+    if not args.show and not summary_figure_output:
         return
     import matplotlib.pyplot as plt
     from matplotlib.animation import FuncAnimation
@@ -1459,7 +1460,7 @@ def visualize_results(history: dict[str, np.ndarray], args: argparse.Namespace) 
     time_values = history["time"]
 
     # 动画使用全部已保存的历史帧：包括随机脉冲、平滑加载和每个载荷步的松弛过程。
-    if not args.skip_animation:
+    if args.show and not args.skip_animation:
         figure, axis = plt.subplots(figsize=(8.5, 7.0))
         axis.plot(outer[:, 0], outer[:, 1], "k", lw=1.4, label="tube walls")
         axis.plot(inner[:, 0], inner[:, 1], "k", lw=1.4)
@@ -1508,6 +1509,18 @@ def visualize_results(history: dict[str, np.ndarray], args: argparse.Namespace) 
     final_phases = np.isin(phase, ("final_perturb_pulse", "final_perturb_relax"))
     primary_terminal_index = int(np.flatnonzero(~final_phases)[-1])
     bend_index = int(np.argmax(np.ptp(positions[:, :, 0], axis=1) + np.ptp(positions[:, :, 1], axis=1)))
+    final_pulse_nodes = np.ravel(np.asarray(history.get("final_perturbation_pulse_nodes", ()), dtype=int))
+    final_pulse_magnitudes = np.ravel(np.asarray(history.get("final_perturbation_pulse_magnitudes", ()), dtype=float))
+    annotation_count = min(final_pulse_nodes.size, final_pulse_magnitudes.size)
+    final_pulse_nodes = final_pulse_nodes[:annotation_count]
+    final_pulse_magnitudes = final_pulse_magnitudes[:annotation_count]
+    valid_final_pulse = (
+        (final_pulse_nodes >= 0)
+        & (final_pulse_nodes < positions.shape[1])
+        & np.isfinite(final_pulse_magnitudes)
+    )
+    final_pulse_nodes = final_pulse_nodes[valid_final_pulse]
+    final_pulse_magnitudes = final_pulse_magnitudes[valid_final_pulse]
     fig, (ax, hist, energy_ax) = plt.subplots(
         3, 1, figsize=(9, 13), gridspec_kw={"height_ratios": (2.2, 1.0, 1.0)},
     )
@@ -1532,6 +1545,13 @@ def visualize_results(history: dict[str, np.ndarray], args: argparse.Namespace) 
     contact = history["contact_active"][primary_terminal_index]
     if np.any(contact):
         ax.scatter(positions[primary_terminal_index, contact, 0], positions[primary_terminal_index, contact, 1], color="magenta", s=25, label="PI contact", zorder=6)
+    if final_pulse_nodes.size:
+        final_pulse_positions = positions[primary_terminal_index, final_pulse_nodes]
+        ax.scatter(
+            final_pulse_positions[:, 0], final_pulse_positions[:, 1], marker="X", s=64,
+            color="tab:purple", edgecolors="white", linewidths=0.7,
+            label="final perturbation nodes", zorder=7,
+        )
     tip = positions[primary_terminal_index, -1]
     arrow = 0.12 * args.total_length * args.tip_direction  # 绿色箭头仅表示用户指定的固定加载方向。
     ax.arrow(tip[0], tip[1], arrow[0], arrow[1], color="green", width=0.0015, head_width=0.018, length_includes_head=True)
@@ -1565,10 +1585,33 @@ def visualize_results(history: dict[str, np.ndarray], args: argparse.Namespace) 
     energy_ax.set_xticks(indices, energy_labels)
     energy_ax.set_ylabel("elastic energy (J)")
     energy_ax.set_title("Final elastic energy (PI contact is non-conservative)")
-    energy_ax.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
+    energy_ax.set_yscale("log")
     energy_ax.grid(axis="y", alpha=0.25)
     energy_ax.legend(loc="best")
-    fig.tight_layout(); plt.show()
+    if final_pulse_nodes.size:
+        final_pulse_text = "\n".join(
+            ["Final perturbation"]
+            + [
+                f"node {node}: {magnitude:.2e} N"
+                for node, magnitude in zip(final_pulse_nodes, final_pulse_magnitudes)
+            ]
+        )
+        fig.tight_layout(rect=(0.0, 0.0, 0.72, 1.0))
+        fig.text(
+            0.76, 0.96, final_pulse_text, ha="left", va="top", fontsize=9,
+            bbox={"boxstyle": "round,pad=0.4", "facecolor": "white", "edgecolor": "0.7", "alpha": 0.95},
+        )
+    else:
+        fig.tight_layout()
+    if summary_figure_output:
+        summary_path = Path(summary_figure_output)
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(summary_path)
+        print(f"[OUTPUT] summary figure saved: {summary_path}")
+    if args.show:
+        plt.show()
+    else:
+        plt.close(fig)
 
 
 def run_self_test(args: argparse.Namespace) -> None:
@@ -1667,6 +1710,10 @@ def parse_args() -> argparse.Namespace:
                         help="单步隐式 Euler 后端；cpp 为 CPU float64 Arc2DCore，python 为 PyTorch 参考路径")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--output-prefix", default="2d_npz/rod_soft_contact_PI_quasi_static_2d_arc")
+    parser.add_argument(
+        "--summary-figure-output", default=None,
+        help="保存第二张静态汇总图的路径；可与 --no-show 一起使用",
+    )
     parser.add_argument("--animation-stride", type=int, default=1, help="动画每隔多少保存帧显示一次；1 表示完整过程")
     parser.add_argument("--animation-fps", type=float, default=30.0, help="动画播放帧率")
     parser.add_argument("--animation-repeat", action="store_true", help="动画播放结束后循环")

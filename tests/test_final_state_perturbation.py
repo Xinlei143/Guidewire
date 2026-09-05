@@ -317,6 +317,78 @@ def test_final_energy_bar_data_groups_primary_and_settled_post_values():
     np.testing.assert_allclose(post, (4.0, 5.0, 6.0))
 
 
+def test_visualization_uses_log_energy_axis_and_reserved_final_perturbation_annotation(monkeypatch):
+    import matplotlib.pyplot as plt
+
+    args = _diagnostic_args()
+    args.show = True
+    args.skip_animation = True
+    args.total_length = 1.0
+    args.tip_direction = np.array([0.0, -1.0])
+    positions = rod.arc_points(args.arc_radius, args.arc_angle_rad, args.num_nodes)
+    history = {
+        "positions": np.stack((positions, positions)),
+        "time": np.array([0.0, args.dt]),
+        "phase": np.array(["primary", "primary"]),
+        "contact_active": np.zeros((2, args.num_nodes), dtype=bool),
+        "max_protection_error": np.zeros(2),
+        "max_pi_force": np.zeros(2),
+        "newton_iterations": np.ones(2),
+        "final_elastic_stretch_energy_j": np.asarray(1.0e-6),
+        "final_elastic_bend_energy_j": np.asarray(2.0e-4),
+        "final_elastic_energy_j": np.asarray(2.01e-4),
+        "final_perturbation_pulse_nodes": np.array([2, 4]),
+        "final_perturbation_pulse_magnitudes": np.array([3.0e-3, 1.25e-2]),
+    }
+    monkeypatch.setattr(plt, "show", lambda: None)
+
+    rod.visualize_results(history, args)
+
+    figure = plt.gcf()
+    assert figure.axes[-1].get_yscale() == "log"
+    annotation = next(text for text in figure.texts if text.get_text().startswith("Final perturbation"))
+    assert annotation.get_text() == "Final perturbation\nnode 2: 3.00e-03 N\nnode 4: 1.25e-02 N"
+    assert annotation.get_position()[0] > figure.axes[0].get_position().x1
+    final_node_marker, = [
+        collection for collection in figure.axes[0].collections
+        if collection.get_label() == "final perturbation nodes"
+    ]
+    np.testing.assert_allclose(final_node_marker.get_offsets(), positions[[2, 4]])
+    plt.close("all")
+
+
+def test_summary_figure_cli_saves_static_summary_without_show(monkeypatch, tmp_path):
+    import matplotlib.pyplot as plt
+
+    output_path = tmp_path / "summary.png"
+    with patch.object(sys, "argv", ["rod", "--summary-figure-output", str(output_path)]):
+        args = rod.parse_args()
+    assert args.summary_figure_output == str(output_path)
+    args.show = False
+    args.skip_animation = True
+    args.total_length = 1.0
+    args.tip_direction = np.array([0.0, -1.0])
+    positions = rod.arc_points(args.arc_radius, args.arc_angle_rad, args.num_nodes)
+    history = {
+        "positions": np.stack((positions, positions)),
+        "time": np.array([0.0, args.dt]),
+        "phase": np.array(["primary", "primary"]),
+        "contact_active": np.zeros((2, args.num_nodes), dtype=bool),
+        "max_protection_error": np.zeros(2),
+        "max_pi_force": np.zeros(2),
+        "newton_iterations": np.ones(2),
+        "final_elastic_stretch_energy_j": np.asarray(1.0e-6),
+        "final_elastic_bend_energy_j": np.asarray(2.0e-4),
+        "final_elastic_energy_j": np.asarray(2.01e-4),
+    }
+    monkeypatch.setattr(plt, "show", lambda: pytest.fail("headless summary output must not show a window"))
+
+    rod.visualize_results(history, args)
+
+    assert output_path.is_file()
+    assert plt.imread(output_path).shape[:2] == (1300, 900)
+
+
 def test_run_simulation_appends_diagnostic_history_and_reports_steady_energy(monkeypatch, tmp_path, capsys):
     args = _diagnostic_args()
     args.torch_device = torch.device("cpu")
