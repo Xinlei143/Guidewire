@@ -873,17 +873,41 @@ py::dict DERCore::implicit_euler_step(
     bool tip_constrained, double tip_displacement, double dt,
     int max_newton_iters, double residual_tol, double step_tol,
     double ki_active) const {
+  const auto initial = checked_array(initial_positions, "initial_positions", 2);
+  if (initial.shape[1] != 3) {
+    throw py::value_error("initial_positions must have shape (N,3)");
+  }
+  py::array_t<double> prescribed(py::array::ShapeContainer(
+      std::vector<py::ssize_t>{initial.shape[0], 3}));
+  const auto* source = static_cast<const double*>(initial.ptr);
+  auto* target = static_cast<double*>(prescribed.request().ptr);
+  std::copy(source, source + 3 * initial.shape[0], target);
+  if (tip_constrained) target[3 * (initial.shape[0] - 1)] -= tip_displacement;
+  return implicit_euler_step_prescribed(
+      positions, velocities, rest_lengths, masses, integrals, prescribed,
+      pulse_forces, tip_constrained, dt, max_newton_iters, residual_tol,
+      step_tol, ki_active);
+}
+
+py::dict DERCore::implicit_euler_step_prescribed(
+    const py::array& positions, const py::array& velocities,
+    const py::array& rest_lengths, const py::array& masses,
+    const py::array& integrals, const py::array& prescribed_positions,
+    const py::array& pulse_forces,
+    bool tip_constrained, double dt,
+    int max_newton_iters, double residual_tol, double step_tol,
+    double ki_active) const {
   const auto p = checked_array(positions, "positions", 2);
   const auto v = checked_array(velocities, "velocities", 2);
   const auto r = checked_array(rest_lengths, "rest_lengths", 1);
   const auto m = checked_array(masses, "masses", 1);
   const auto ii = checked_array(integrals, "integrals", 1);
-  const auto initial = checked_array(initial_positions, "initial_positions", 2);
+  const auto prescribed_input = checked_array(prescribed_positions, "prescribed_positions", 2);
   const auto pulse = checked_array(pulse_forces, "pulse_forces", 2);
   const ssize_t nodes = p.shape[0];
   if (nodes < 4 || p.shape[1] != 3 || v.shape[0] != nodes || v.shape[1] != 3 ||
       r.shape[0] != nodes - 1 || m.shape[0] != nodes || ii.shape[0] != nodes ||
-      initial.shape[0] != nodes || initial.shape[1] != 3 ||
+      prescribed_input.shape[0] != nodes || prescribed_input.shape[1] != 3 ||
       pulse.shape[0] != nodes || pulse.shape[1] != 3) {
     throw py::value_error("implicit step shape mismatch");
   }
@@ -892,7 +916,7 @@ py::dict DERCore::implicit_euler_step(
   const auto* rest = static_cast<const double*>(r.ptr);
   const auto* mass = static_cast<const double*>(m.ptr);
   const auto* old_integral = static_cast<const double*>(ii.ptr);
-  const auto* initial_p = static_cast<const double*>(initial.ptr);
+  const auto* prescribed_data = static_cast<const double*>(prescribed_input.ptr);
   const auto* pulse_ptr = static_cast<const double*>(pulse.ptr);
   const int first_free = 2;
   const int last_free = static_cast<int>(nodes) - (tip_constrained ? 1 : 0);
@@ -913,10 +937,9 @@ py::dict DERCore::implicit_euler_step(
       old_full(3 * n + k) = old_p[3 * n + k];
       velocity_full(3 * n + k) = old_v[3 * n + k];
       pulse_full(3 * n + k) = pulse_ptr[3 * n + k];
-      prescribed(3 * n + k) = initial_p[3 * n + k];
+      prescribed(3 * n + k) = prescribed_data[3 * n + k];
     }
   }
-  if (tip_constrained) prescribed(3 * (nodes - 1)) -= tip_displacement;
   for (int n = first_free; n < last_free; ++n) {
     for (int k = 0; k < 3; ++k) {
       const int j = 3 * (n - first_free) + k;
@@ -1255,6 +1278,22 @@ py::dict DERCore::implicit_euler_step_cached(
       positions, velocities, rest, mass, integrals, initial_positions,
       pulse_forces, tip_constrained, tip_displacement, dt, max_newton_iters,
       residual_tol, step_tol, ki_active);
+}
+
+py::dict DERCore::implicit_euler_step_prescribed_cached(
+    const py::array& positions, const py::array& velocities,
+    const py::array& integrals, const py::array& prescribed_positions,
+    const py::array& pulse_forces, bool tip_constrained,
+    double dt, int max_newton_iters, double residual_tol,
+    double step_tol, double ki_active) const {
+  py::array_t<double> rest(static_cast<py::ssize_t>(rest_lengths_.size()),
+                           rest_lengths_.data());
+  py::array_t<double> mass(static_cast<py::ssize_t>(masses_.size()),
+                           masses_.data());
+  return implicit_euler_step_prescribed(
+      positions, velocities, rest, mass, integrals, prescribed_positions,
+      pulse_forces, tip_constrained, dt, max_newton_iters, residual_tol,
+      step_tol, ki_active);
 }
 
 }  // namespace der

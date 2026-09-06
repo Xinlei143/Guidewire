@@ -47,6 +47,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("pulse_forces"), py::arg("tip_constrained"),
            py::arg("tip_displacement"), py::arg("dt"),
            py::arg("max_newton_iters"), py::arg("residual_tol"),
+           py::arg("step_tol"), py::arg("ki_active"))
+      .def("implicit_euler_step_prescribed", &der::DERCore::implicit_euler_step_prescribed,
+           py::arg("positions"), py::arg("velocities"),
+           py::arg("rest_lengths"), py::arg("masses"), py::arg("integrals"),
+           py::arg("prescribed_positions"), py::arg("pulse_forces"),
+           py::arg("tip_constrained"), py::arg("dt"),
+           py::arg("max_newton_iters"), py::arg("residual_tol"),
+           py::arg("step_tol"), py::arg("ki_active"))
+      .def("implicit_euler_step_prescribed_cached", &der::DERCore::implicit_euler_step_prescribed_cached,
+           py::arg("positions"), py::arg("velocities"), py::arg("integrals"),
+           py::arg("prescribed_positions"), py::arg("pulse_forces"),
+           py::arg("tip_constrained"), py::arg("dt"),
+           py::arg("max_newton_iters"), py::arg("residual_tol"),
            py::arg("step_tol"), py::arg("ki_active"));
 
   py::class_<der::Arc2DCore>(m, "Arc2DCore")

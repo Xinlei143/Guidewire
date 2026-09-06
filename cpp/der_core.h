@@ -51,6 +51,19 @@ class DERCore {
       const py::array& pulse_forces, bool tip_constrained,
       double tip_displacement, double dt, int max_newton_iters,
       double residual_tol, double step_tol, double ki_active) const;
+  py::dict implicit_euler_step_prescribed(
+      const py::array& positions, const py::array& velocities,
+      const py::array& rest_lengths, const py::array& masses,
+      const py::array& integrals, const py::array& prescribed_positions,
+      const py::array& pulse_forces, bool tip_constrained, double dt,
+      int max_newton_iters, double residual_tol, double step_tol,
+      double ki_active) const;
+  py::dict implicit_euler_step_prescribed_cached(
+      const py::array& positions, const py::array& velocities,
+      const py::array& integrals, const py::array& prescribed_positions,
+      const py::array& pulse_forces, bool tip_constrained, double dt,
+      int max_newton_iters, double residual_tol, double step_tol,
+      double ki_active) const;
 
  private:
   std::vector<double> rest_lengths_;

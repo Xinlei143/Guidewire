@@ -186,6 +186,38 @@ class DERCore:
             float(ki_active),
         )
 
+    def implicit_euler_step_prescribed(
+        self, positions, velocities, rest_lengths, masses, integrals,
+        prescribed_positions, pulse_forces, tip_constrained, dt,
+        max_newton_iters, residual_tol, step_tol, ki_active,
+    ):
+        return self._impl.implicit_euler_step_prescribed(
+            _array(positions, "positions"),
+            _array(velocities, "velocities"),
+            _array(rest_lengths, "rest_lengths"),
+            _array(masses, "masses"),
+            _array(integrals, "integrals"),
+            _array(prescribed_positions, "prescribed_positions"),
+            _array(pulse_forces, "pulse_forces"),
+            bool(tip_constrained), float(dt), int(max_newton_iters),
+            float(residual_tol), float(step_tol), float(ki_active),
+        )
+
+    def implicit_euler_step_prescribed_cached(
+        self, positions, velocities, integrals, prescribed_positions,
+        pulse_forces, tip_constrained, dt, max_newton_iters,
+        residual_tol, step_tol, ki_active,
+    ):
+        return self._impl.implicit_euler_step_prescribed_cached(
+            _array(positions, "positions"),
+            _array(velocities, "velocities"),
+            _array(integrals, "integrals"),
+            _array(prescribed_positions, "prescribed_positions"),
+            _array(pulse_forces, "pulse_forces"),
+            bool(tip_constrained), float(dt), int(max_newton_iters),
+            float(residual_tol), float(step_tol), float(ki_active),
+        )
+
 
 class Arc2DCore:
     """Strict NumPy facade for the independent CPU float64 Arc2D core."""

@@ -21,6 +21,7 @@ import torch
 import der_cpp_backend
 import torch.nn.functional as F
 import mesh_contact_v4
+from centerline_3d import Centerline3D
 
 
 ROOT = Path(__file__).resolve().parent
@@ -34,6 +35,7 @@ DEVICE_DEFAULT = "auto"
 BACKEND_DEFAULT = "cpp"
 CONTACT_TYPE_DEFAULT = "tube"
 MESH_OBJ_DEFAULT = ROOT / "tube_obj" / "straight_tube_L1p5m_boundaryR50mm_shellR60mm_32sides_axial2.obj"
+CENTERLINE_CSV_DEFAULT = None
 
 # --- 导丝材料与离散 ---
 TOTAL_LENGTH = 1.5                 # 导丝初始长度；x 轴方向从 0 延伸到该值
@@ -144,12 +146,16 @@ def initialize_rod(
     num_nodes: int = NUM_NODES,
     diameter: float = DIAMETER,
     density: float = MATERIAL_DENSITY,
+    centerline: Centerline3D | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Create an initially straight 3-D rod; the pulse selects buckling."""
+    """Create a zero-stretch straight or centerline-following 3-D rod."""
     if num_nodes < 4:
         raise ValueError("num_nodes must be at least 4")
-    positions = np.zeros((num_nodes, 3), dtype=np.float64)
-    positions[:, 0] = np.linspace(0.0, total_length, num_nodes)
+    if centerline is None:
+        positions = np.zeros((num_nodes, 3), dtype=np.float64)
+        positions[:, 0] = np.linspace(0.0, total_length, num_nodes)
+    else:
+        positions = centerline.sample_by_arclength(total_length, num_nodes)
     rest_lengths = np.linalg.norm(np.diff(positions, axis=0), axis=1)
     total_mass, _, _, _ = rod_properties(total_length, diameter, density)
     masses = np.full(num_nodes, total_mass / (num_nodes - 1), dtype=np.float64)
@@ -202,6 +208,7 @@ def make_explicit_pulse_profile(
 
 def make_initial_pulse_profile(
     args: argparse.Namespace,
+    centerline: Centerline3D | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Select pulse nodes and forces: either fully explicit or fully random.
 
@@ -223,14 +230,27 @@ def make_initial_pulse_profile(
     candidate_nodes = np.arange(2, args.num_nodes - 1, dtype=int)
     pulse_count = int(rng.integers(args.pulse_count_min, args.pulse_count_max + 1))
     nodes = np.sort(rng.choice(candidate_nodes, size=pulse_count, replace=False))
-    # 在 y/z 平面均匀随机取角度；x 分量严格为 0，因此不会人为施加轴向脉冲。
     angles_rad = rng.uniform(0.0, 2.0 * math.pi, size=pulse_count)
     magnitudes = rng.uniform(args.pulse_force_min, args.pulse_force_max, size=pulse_count)
-    unit_directions = np.column_stack((
-        np.zeros(pulse_count, dtype=np.float64),
-        np.cos(angles_rad),
-        np.sin(angles_rad),
-    ))
+    if centerline is None:
+        # Legacy straight mode: preserve global y/z pulse semantics exactly.
+        unit_directions = np.column_stack((
+            np.zeros(pulse_count, dtype=np.float64),
+            np.cos(angles_rad),
+            np.sin(angles_rad),
+        ))
+        args.pulse_frame = "global_yz"
+    else:
+        node_s = np.linspace(0.0, args.total_length, args.num_nodes)
+        tangents, normals, binormals = centerline.frames_at_s(node_s)
+        unit_directions = (
+            np.cos(angles_rad)[:, None] * normals[nodes]
+            + np.sin(angles_rad)[:, None] * binormals[nodes]
+        )
+        args.pulse_frame = "bishop_normal_plane"
+        args.pulse_frame_tangents = tangents[nodes].copy()
+        args.pulse_frame_normals = normals[nodes].copy()
+        args.pulse_frame_binormals = binormals[nodes].copy()
     profile = np.zeros((args.num_nodes, 3), dtype=np.float64)
     profile[nodes] = magnitudes[:, None] * unit_directions
     return nodes, magnitudes, angles_rad, unit_directions, profile
@@ -487,6 +507,29 @@ def _ensure_mesh_geometry(args: argparse.Namespace, device: torch.device) -> mes
     return geometry
 
 
+def validate_centerline_mesh(
+    centerline: Centerline3D,
+    geometry: mesh_contact_v4.MeshGeometry,
+    rod_length: float,
+    sample_count: int = 65,
+) -> np.ndarray:
+    """Fail fast when the centerline and protection mesh use incompatible geometry."""
+    if rod_length > centerline.length + 2.0e-12 * max(1.0, centerline.length):
+        raise ValueError(
+            f"centerline length {centerline.length:.17g} is shorter than rod length {rod_length:.17g}"
+        )
+    samples = centerline.point_at_s(np.linspace(0.0, rod_length, sample_count))
+    points = torch.as_tensor(samples, dtype=torch.float64, device=geometry.triangles.device)
+    details = geometry.nearest(points)
+    clearances = details.clearance.detach().cpu().numpy()
+    if not np.isfinite(clearances).all() or np.any(clearances <= 0.0):
+        raise ValueError(
+            "centerline must remain inside the mesh protection surface; "
+            f"minimum signed clearance is {float(np.nanmin(clearances)):.6e} m"
+        )
+    return clearances
+
+
 def _mesh_details(
     positions: torch.Tensor, args: argparse.Namespace, geometry: mesh_contact_v4.MeshGeometry | None = None,
 ) -> mesh_contact_v4.MeshContactDetails:
@@ -653,13 +696,21 @@ def make_prescribed_state(
     initial: torch.Tensor,
     tip_constrained: bool,
     tip_displacement: float,
+    args: argparse.Namespace | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     mask = torch.zeros_like(initial, dtype=torch.bool)
     mask[:2] = True  # 左端前两个节点全自由度固定，相当于夹持端
     values = initial.clone()
     if tip_constrained:
         mask[-1] = True  # 脉冲结束后，最后一个节点成为位移控制端
-        values[-1, 0] -= tip_displacement  # 从初始约 1 m 位置沿 -x 向内压缩
+        centerline = getattr(args, "centerline", None) if args is not None else None
+        if centerline is None:
+            values[-1, 0] -= tip_displacement  # legacy straight mode: global -x
+        else:
+            tip_s = float(args.total_length) - float(tip_displacement)
+            values[-1] = torch.as_tensor(
+                centerline.point_at_s(tip_s), dtype=initial.dtype, device=initial.device,
+            )
     return mask, values
 
 
@@ -939,7 +990,9 @@ def _implicit_euler_step_python(
         if breakdown is not None:
             breakdown[key] = breakdown.get(key, 0.0) + (time.perf_counter() - started)
 
-    prescribed_mask, prescribed = make_prescribed_state(initial_positions, tip_constrained, tip_displacement)
+    prescribed_mask, prescribed = make_prescribed_state(
+        initial_positions, tip_constrained, tip_displacement, args
+    )
     free_mask = ~prescribed_mask
     block_plan = get_block_assembly_plan(str(positions.device), len(positions), tip_constrained)
     previous_radius = torch.linalg.norm(positions[:, 1:], dim=1)
@@ -1096,14 +1149,16 @@ def _cpp_implicit_euler_step(
         raise ValueError("--backend cpp is CPU-only; use --backend python for CUDA")
     args.dt_active = dt_step
     core = _get_core(args, rest_lengths, masses)
-    result = core.implicit_euler_step_cached(
+    prescribed_mask, prescribed = make_prescribed_state(
+        initial_positions, tip_constrained, tip_displacement, args
+    )
+    result = core.implicit_euler_step_prescribed_cached(
         _as_numpy(positions, "positions"),
         _as_numpy(velocities, "velocities"),
         _as_numpy(integrals, "integrals"),
-        _as_numpy(initial_positions, "initial_positions"),
+        _as_numpy(prescribed, "prescribed_positions"),
         _as_numpy(pulse_forces, "pulse_forces"),
         tip_constrained,
-        tip_displacement,
         dt_step,
         args.max_newton_iters,
         args.residual_tol,
@@ -1114,9 +1169,6 @@ def _cpp_implicit_euler_step(
     device = positions.device
     as_tensor = lambda value: torch.as_tensor(value, dtype=dtype, device=device)
     as_bool = lambda value: torch.as_tensor(value, dtype=torch.bool, device=device)
-    prescribed_mask, _ = make_prescribed_state(
-        initial_positions, tip_constrained, tip_displacement
-    )
     info = NewtonInfo(
         bool(result["converged"]),
         int(result["iterations"]),
@@ -1182,6 +1234,43 @@ def max_free_speed(velocities: torch.Tensor, prescribed_mask: torch.Tensor) -> f
     return float(torch.linalg.vector_norm(velocities[free_nodes], dim=1).max()) if bool(torch.any(free_nodes)) else 0.0
 
 
+def prebalance_zero_displacement(
+    state: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    zero_forces: torch.Tensor,
+    args: argparse.Namespace,
+    step_once,
+) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], tuple | None, int]:
+    """Hold both ends at zero insertion until the curved initial state settles."""
+    if not args.prebalance:
+        return state, None, 0
+    stable = 0
+    latest = None
+    for step in range(1, args.prebalance_max_steps + 1):
+        latest = step_once(state, zero_forces, True, 0.0)
+        state = latest[:3]
+        info = latest[8]
+        max_speed = max_free_speed(latest[1], latest[9])
+        max_error = float(torch.max(latest[6]))
+        if (
+            info.converged
+            and max_speed < args.settle_speed_tol
+            and info.residual_norm < args.settle_residual_tol
+            and max_error < args.contact_tolerance
+        ):
+            stable += 1
+        else:
+            stable = 0
+        if stable >= args.settle_confirm_steps:
+            return state, latest, step
+    assert latest is not None
+    raise RuntimeError(
+        f"prebalance did not settle in {args.prebalance_max_steps} steps: "
+        f"speed={max_free_speed(latest[1], latest[9]):.3e} m/s, "
+        f"residual={latest[8].residual_norm:.3e} N, "
+        f"protection error={float(torch.max(latest[6])) * 1.0e3:.4f} mm"
+    )
+
+
 def summarize_contact_segments(active: np.ndarray, forces: np.ndarray, positions: np.ndarray) -> dict[str, np.ndarray]:
     nodes = np.flatnonzero(active)
     if not len(nodes):
@@ -1203,7 +1292,8 @@ def summarize_contact_segments(active: np.ndarray, forces: np.ndarray, positions
 
 def run_simulation(args: argparse.Namespace) -> dict[str, np.ndarray]:
     positions, velocities, rest_lengths, masses, integrals = initialize_rod(
-        args.total_length, args.num_nodes, args.diameter, args.density
+        args.total_length, args.num_nodes, args.diameter, args.density,
+        centerline=getattr(args, "centerline", None),
     )
     device = args.torch_device
     positions = torch.as_tensor(positions, dtype=DTYPE, device=device)
@@ -1213,6 +1303,10 @@ def run_simulation(args: argparse.Namespace) -> dict[str, np.ndarray]:
     integrals = torch.as_tensor(integrals, dtype=DTYPE, device=device)
     if getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) == "mesh":
         geometry = _ensure_mesh_geometry(args, device)
+        if getattr(args, "centerline", None) is not None:
+            args.centerline_mesh_clearances = validate_centerline_mesh(
+                args.centerline, geometry, args.total_length,
+            )
         args.mesh_preprocess_stats = geometry.preprocess_stats.as_dict()
         print(
             "mesh preprocessing: "
@@ -1232,12 +1326,14 @@ def run_simulation(args: argparse.Namespace) -> dict[str, np.ndarray]:
         pulse_angles_rad,
         pulse_unit_directions,
         pulse_profile,
-    ) = make_initial_pulse_profile(args)
+    ) = make_initial_pulse_profile(args, centerline=getattr(args, "centerline", None))
     pulse_forces = torch.as_tensor(pulse_profile, dtype=DTYPE, device=device)
     zero_forces = torch.zeros_like(positions)
     history: dict[str, list] = {key: [] for key in (
-        "time", "load_step", "tip_displacement", "positions", "velocities", "pi_forces",
+        "time", "phase", "load_step", "tip_displacement", "tip_target_xyz",
+        "positions", "velocities", "pi_forces",
         "pi_integrals", "contact_active", "contact_weight", "radial_distance",
+        "centerline_s", "distance_to_centerline", "mesh_clearance",
         "max_protection_error", "max_pi_force", "newton_iterations", "newton_residual",
         "elastic_stretch_energy_j", "elastic_bend_energy_j", "elastic_total_energy_j",
         "newton_converged", "tip_position_constraint_active",
@@ -1247,7 +1343,7 @@ def run_simulation(args: argparse.Namespace) -> dict[str, np.ndarray]:
     # 内部时间去向，用于诊断真实世界中的每步计算耗时。
     args.performance_profile = getattr(args, "performance_profile", None) or {}
     args.dt_timings: list[dict] = []
-    args._dt_phase = "pulse"
+    args._dt_phase = "initial"
     args._current_dt_record: dict | None = None
     time_value = 0.0
     abort_reason: str | None = None
@@ -1278,8 +1374,11 @@ def run_simulation(args: argparse.Namespace) -> dict[str, np.ndarray]:
     ) -> None:
         p_np = tensor_to_numpy(positions).copy()
         history["time"].append(time_value)
+        history["phase"].append(args._dt_phase)
         history["load_step"].append(load_step)
         history["tip_displacement"].append(displacement)
+        _, prescribed = make_prescribed_state(initial_positions, tip_constrained, displacement, args)
+        history["tip_target_xyz"].append(tensor_to_numpy(prescribed[-1]).copy())
         history["positions"].append(p_np)
         history["velocities"].append(tensor_to_numpy(velocities).copy())
         history["pi_forces"].append(tensor_to_numpy(force).copy())
@@ -1287,7 +1386,22 @@ def run_simulation(args: argparse.Namespace) -> dict[str, np.ndarray]:
         history["contact_active"].append(tensor_to_numpy(active).copy())
         history["contact_weight"].append(tensor_to_numpy(weights).copy())
         history["radial_distance"].append(np.linalg.norm(p_np[:, 1:], axis=1))
-        protection = compute_contact_error(positions, args)
+        centerline = getattr(args, "centerline", None)
+        if centerline is None:
+            history["centerline_s"].append(np.full(args.num_nodes, np.nan))
+            history["distance_to_centerline"].append(np.full(args.num_nodes, np.nan))
+        else:
+            centerline_s, centerline_distance = centerline.project(p_np)
+            history["centerline_s"].append(centerline_s)
+            history["distance_to_centerline"].append(centerline_distance)
+        if getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) == "mesh":
+            details = _mesh_details(positions, args)
+            mesh_clearance = tensor_to_numpy(details.clearance).copy()
+            protection = torch.clamp(-details.clearance, min=0.0)
+        else:
+            mesh_clearance = np.full(args.num_nodes, np.nan)
+            protection = compute_contact_error(positions, args)
+        history["mesh_clearance"].append(mesh_clearance)
         history["max_protection_error"].append(float(torch.max(protection)))
         history["max_pi_force"].append(float(torch.linalg.vector_norm(force, dim=1).max()))
         history["newton_iterations"].append(info.iterations)
@@ -1461,28 +1575,65 @@ def run_simulation(args: argparse.Namespace) -> dict[str, np.ndarray]:
     else:
         pulse_kind = "random"
         seed_note = f"seed={args.pulse_seed}"
+    pulse_frame_label = getattr(args, "pulse_frame", "global_yz")
+    pulse_tip_note = "held on centerline" if getattr(args, "centerline", None) is not None else "free"
     print(
-        f"initial {pulse_kind} yz-plane pulses: count={len(pulse_nodes)}, nodes={pulse_nodes.tolist()}, "
+        f"initial {pulse_kind} {pulse_frame_label} pulses: count={len(pulse_nodes)}, nodes={pulse_nodes.tolist()}, "
         f"magnitudes={np.array2string(pulse_magnitudes, precision=4)}, {seed_note}, "
-        f"duration={args.pulse_duration:.6e} s; right tip is free during pulse",
+        f"duration={args.pulse_duration:.6e} s; right tip is {pulse_tip_note} during pulse",
         flush=True,
     )
 
-    # The initially straight rod receives only this short, user-configurable
-    # force pulse.  Compression begins after the right tip has been free.
-    while time_value < args.pulse_duration - 1.0e-15:
-        dt_step = min(args.dt, args.pulse_duration - time_value)
+    prebalanced_positions = initial.copy()
+    if args.prebalance:
+        print("[PREBALANCE] zero tip displacement; both ends held on the centerline", flush=True)
+        args._dt_phase = "prebalance"
+
+        def prebalance_step(state, forces, tip_constrained, displacement):
+            accepted, result, _subdivisions, failed_info = retry_step(
+                state, forces, tip_constrained, displacement, displacement,
+                phase_label="zero-displacement prebalance",
+            )
+            if not accepted:
+                residual = math.nan if failed_info is None else failed_info.residual_norm
+                raise RuntimeError(f"Newton failure during prebalance: residual={residual:.3e}")
+            return result
+
+        (positions, velocities, integrals), prebalance_result, prebalance_steps = prebalance_zero_displacement(
+            (positions, velocities, integrals), zero_forces, args, prebalance_step,
+        )
+        time_value += prebalance_steps * args.dt
+        if prebalance_result is not None:
+            (
+                _p, _v, _i, last_force, last_active, weights, _errors, _distances,
+                last_info, _mask,
+            ) = prebalance_result
+            record(-1, 0.0, last_force, last_active, weights, last_info, True)
+        prebalanced_positions = tensor_to_numpy(positions).copy()
+        print(f"[PREBALANCE COMPLETE] steps={prebalance_steps}", flush=True)
+
+    # Curved mode holds the centerline tip during the pulse, matching the 2-D arc setup.
+    # Legacy straight mode keeps its historical free-tip pulse behavior.
+    args._dt_phase = "pulse"
+    pulse_tip_constrained = getattr(args, "centerline", None) is not None
+    pulse_elapsed = 0.0
+    while pulse_elapsed < args.pulse_duration - 1.0e-15:
+        dt_step = min(args.dt, args.pulse_duration - pulse_elapsed)
         (
             positions, velocities, integrals, last_force, last_active, weights, _errors, _distances,
             last_info, prescribed_mask,
-        ) = advance((positions, velocities, integrals), pulse_forces, False, 0.0, dt_step)
+        ) = advance(
+            (positions, velocities, integrals), pulse_forces,
+            pulse_tip_constrained, 0.0, dt_step,
+        )
         total_newton_iterations += last_info.iterations
         time_value += dt_step
+        pulse_elapsed += dt_step
         if not last_info.converged and last_info.residual_norm >= args.residual_tol:
             abort_reason = f"Newton failure during initial pulse: residual={last_info.residual_norm:.3e}"
             print(f"EARLY ABORT: {abort_reason}")
             break
-        record(0, 0.0, last_force, last_active, weights, last_info, False)
+        record(0, 0.0, last_force, last_active, weights, last_info, pulse_tip_constrained)
 
     for load_step in range(1, args.num_load_steps + 1):
         if abort_reason:
@@ -1781,6 +1932,9 @@ def run_simulation(args: argparse.Namespace) -> dict[str, np.ndarray]:
         "npz_path": np.asarray(str(npz_path)),
         "picture_path": np.asarray(str(picture_path)),
         "initial_positions": initial,
+        "prebalanced_positions": prebalanced_positions,
+        "prebalance_enabled": np.asarray(args.prebalance),
+        "prebalance_max_steps": np.asarray(args.prebalance_max_steps),
         "initial_pulse_count": np.asarray(len(pulse_nodes), dtype=int),
         "initial_pulse_seed": np.asarray(-1 if args.pulse_seed is None else args.pulse_seed, dtype=int),
         "initial_pulse_nodes": pulse_nodes,
@@ -1789,6 +1943,12 @@ def run_simulation(args: argparse.Namespace) -> dict[str, np.ndarray]:
         "initial_pulse_angles_rad": pulse_angles_rad,
         "initial_pulse_unit_directions": pulse_unit_directions,
         "initial_pulse_force_vectors_n": pulse_profile[pulse_nodes],
+        "initial_pulse_frame": np.asarray(getattr(args, "pulse_frame", "global_yz")),
+        "initial_pulse_centerline_s_m": (
+            np.linspace(0.0, args.total_length, args.num_nodes)[pulse_nodes]
+            if getattr(args, "centerline", None) is not None
+            else np.full(len(pulse_nodes), np.nan)
+        ),
         "initial_pulse_duration_s": np.asarray(args.pulse_duration),
         "completed_load_steps": np.asarray(completed_steps),
         "load_step_implicit_steps": np.asarray(load_step_relaxation_steps, dtype=int),
@@ -1826,6 +1986,13 @@ def run_simulation(args: argparse.Namespace) -> dict[str, np.ndarray]:
         "cpp_dense_fallback_count": np.asarray(getattr(args, "cpp_dense_fallback_count_total", 0)),
         "cpp_banded_solve_count": np.asarray(getattr(args, "cpp_banded_solve_count_total", 0)),
     })
+    if getattr(args, "centerline", None) is not None:
+        history_np.update({
+            "centerline_csv": np.asarray(str(args.centerline_csv)),
+            "centerline_points": args.centerline.points.copy(),
+            "centerline_cumulative_s": args.centerline.cumulative_s.copy(),
+            "centerline_mesh_clearances": np.asarray(args.centerline_mesh_clearances),
+        })
     dt_timings = getattr(args, "dt_timings", None) or []
     if dt_timings:
         dt_phases = np.asarray([rec["phase"] for rec in dt_timings])
@@ -1901,7 +2068,7 @@ def run_simulation(args: argparse.Namespace) -> dict[str, np.ndarray]:
                 f"max={realtime.max():.6f} | pass={np.mean(realtime <= 1.0):.2%}"
             )
         print("  per-phase dt breakdown:")
-        for phase_name in ("pulse", "ramp", "continuation", "micro", "relax"):
+        for phase_name in ("prebalance", "pulse", "ramp", "continuation", "micro", "relax"):
             mask = dt_phases == phase_name
             count = int(mask.sum())
             if count == 0:
@@ -2148,8 +2315,62 @@ def _visualization_surface(
     return surface
 
 
+def _mesh_visualization_triangles(
+    geometry: mesh_contact_v4.MeshGeometry, *, max_faces: int = 12000,
+) -> np.ndarray:
+    """Return a deterministic bounded-size sample of the imported OBJ faces."""
+    if max_faces <= 0:
+        raise ValueError("max_faces must be positive")
+    cache_key = (id(geometry), int(max_faces))
+    cached = getattr(geometry, "_direct_visualization_cache", None)
+    if cached is not None and cached[0] == cache_key:
+        return cached[1]
+    vertices = geometry.vertices.detach().cpu().numpy()
+    faces = geometry.face_indices.detach().cpu().numpy()
+    if len(faces) <= max_faces:
+        selected = np.arange(len(faces), dtype=np.int64)
+    else:
+        extreme_vertices = np.unique(np.concatenate((
+            np.argmin(vertices, axis=0), np.argmax(vertices, axis=0),
+        )))
+        required = np.flatnonzero(np.any(np.isin(faces, extreme_vertices), axis=1))
+        regular = np.linspace(0, len(faces) - 1, max_faces, dtype=np.int64)
+        selected = np.unique(np.concatenate((required, regular)))
+        if len(selected) > max_faces:
+            required_set = set(required.tolist())
+            optional = np.asarray([value for value in selected if value not in required_set])
+            keep_optional = optional[np.linspace(
+                0, len(optional) - 1, max_faces - len(required), dtype=np.int64,
+            )]
+            selected = np.sort(np.concatenate((required, keep_optional)))
+        elif len(selected) < max_faces:
+            missing = np.setdiff1d(np.arange(len(faces)), selected, assume_unique=True)
+            selected = np.sort(np.concatenate((selected, missing[:max_faces - len(selected)])))
+    triangles = np.ascontiguousarray(vertices[faces[selected]], dtype=np.float64)
+    geometry._direct_visualization_cache = (cache_key, triangles)
+    return triangles
+
+
+def _draw_vessel(ax, args: argparse.Namespace, surface=None) -> None:
+    geometry = getattr(args, "mesh_geometry", None)
+    if getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) == "mesh" and geometry is not None:
+        from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+        triangles = _mesh_visualization_triangles(geometry)
+        collection = Poly3DCollection(
+            triangles, facecolor="lightsteelblue", edgecolor="none", alpha=0.16,
+        )
+        ax.add_collection3d(collection)
+        centerline = getattr(args, "centerline", None)
+        if centerline is not None:
+            ax.plot(*centerline.points.T, color="0.35", ls="--", lw=1.0, label="centerline")
+        return
+    assert surface is not None
+    ax.plot_surface(*surface, color="lightsteelblue", alpha=0.18, linewidth=0)
+
+
 def _set_visualization_bounds(
-    ax, positions: np.ndarray, surface: tuple[np.ndarray, np.ndarray, np.ndarray],
+    ax, positions: np.ndarray, surface: tuple[np.ndarray, np.ndarray, np.ndarray] | None,
     args: argparse.Namespace,
 ) -> None:
     """Use proxy-and-rod bounds for mesh mode, preserving tube-mode framing."""
@@ -2159,9 +2380,16 @@ def _set_visualization_bounds(
         ax.set_zlim(-1.15 * args.tube_radius, 1.15 * args.tube_radius)
         ax.set_box_aspect((args.total_length, 6 * args.tube_radius, 6 * args.tube_radius))
         return
+    geometry = getattr(args, "mesh_geometry", None)
+    if geometry is not None:
+        vessel_coordinates = geometry.vertices.detach().cpu().numpy()
+    else:
+        assert surface is not None
+        vessel_coordinates = np.column_stack([
+            surface[0].ravel(), surface[1].ravel(), surface[2].ravel(),
+        ])
     coordinates = np.concatenate((
-        np.asarray(positions, dtype=np.float64).reshape(-1, 3),
-        np.column_stack([surface[0].ravel(), surface[1].ravel(), surface[2].ravel()]),
+        np.asarray(positions, dtype=np.float64).reshape(-1, 3), vessel_coordinates,
     ), axis=0)
     lower = coordinates.min(axis=0)
     upper = coordinates.max(axis=0)
@@ -2181,12 +2409,17 @@ def create_final_result_figure(history: dict[str, np.ndarray], args: argparse.Na
     from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
     positions = history["positions"]
-    surface = _visualization_surface(args, axial_samples=24, circumferential_samples=16)
-    X, Y, Z = surface
+    direct_mesh = (
+        getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) == "mesh"
+        and getattr(args, "mesh_geometry", None) is not None
+    )
+    surface = None if direct_mesh else _visualization_surface(
+        args, axial_samples=24, circumferential_samples=16,
+    )
     fig = plt.figure(figsize=(16, 10), dpi=180)
 
     ax = fig.add_axes([0.02, 0.37, 0.96, 0.60], projection="3d")
-    ax.plot_surface(X, Y, Z, color="lightsteelblue", alpha=0.18, linewidth=0)
+    _draw_vessel(ax, args, surface)
     ax.plot(*positions[0].T, "k--", lw=1.2, label="initial")
     ax.plot(*positions[-1].T, color="tab:blue", lw=1.9, label="final deformation")
     active = history["contact_active"][-1]
@@ -2194,7 +2427,7 @@ def create_final_result_figure(history: dict[str, np.ndarray], args: argparse.Na
         ax.scatter(*positions[-1, active].T, c="magenta", s=18, label="final contact")
     ax.set(
         xlabel="x (m)", ylabel="y (m)", zlabel="z (m)",
-        title=("Final guidewire deformation in the imported mesh (simplified display)"
+        title=("Final guidewire deformation in the imported vessel mesh"
                if getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) == "mesh"
                else "Final guidewire deformation in the straight cylindrical tube"),
     )
@@ -2205,22 +2438,31 @@ def create_final_result_figure(history: dict[str, np.ndarray], args: argparse.Na
     load_ax = fig.add_axes([0.03, 0.05, 0.57, 0.23])
     load_ax.axis("off")
     nodes = np.asarray(history["initial_pulse_nodes"], dtype=int)
-    x_positions = np.asarray(history["initial_pulse_x_m"], dtype=float)
+    curved = getattr(args, "centerline", None) is not None
+    position_values = np.asarray(
+        history["initial_pulse_centerline_s_m"] if curved else history["initial_pulse_x_m"],
+        dtype=float,
+    )
     magnitudes = np.asarray(history["initial_pulse_magnitudes_n"], dtype=float)
     force_vectors = np.asarray(history["initial_pulse_force_vectors_n"], dtype=float)
     rows = [
-        [str(node), f"{x_value:.4f}", f"{magnitude:.4e}", f"{force[1]:.4e}", f"{force[2]:.4e}"]
-        for node, x_value, magnitude, force in zip(nodes, x_positions, magnitudes, force_vectors)
+        [str(node), f"{position:.4f}", f"{magnitude:.4e}",
+         f"{force[0]:.4e}", f"{force[1]:.4e}", f"{force[2]:.4e}"]
+        for node, position, magnitude, force in zip(nodes, position_values, magnitudes, force_vectors)
     ]
     table = load_ax.table(
         cellText=rows,
-        colLabels=["node", "x (m)", "|F| (N)", "Fy (N)", "Fz (N)"],
+        colLabels=["node", "s (m)" if curved else "x (m)", "|F| (N)", "Fx (N)", "Fy (N)", "Fz (N)"],
         cellLoc="center", loc="center",
     )
     table.auto_set_font_size(False)
     table.set_fontsize(8.5)
     table.scale(1.0, 1.25)
-    load_ax.set_title("Random initial pulse loads (all directions are in the y/z plane)", fontsize=10, pad=5)
+    load_ax.set_title(
+        "Random initial pulse loads (Bishop normal plane)" if curved
+        else "Random initial pulse loads (all directions are in the y/z plane)",
+        fontsize=10, pad=5,
+    )
 
     energy_ax = fig.add_axes([0.66, 0.07, 0.30, 0.21])
     final_stretch = float(history["elastic_stretch_energy_j"][-1])
@@ -2282,8 +2524,13 @@ def visualize_results(history: dict[str, np.ndarray], args: argparse.Namespace) 
     from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
     positions = history["positions"]
-    surface = _visualization_surface(args, axial_samples=16, circumferential_samples=12)
-    X, Y, Z = surface
+    direct_mesh = (
+        getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) == "mesh"
+        and getattr(args, "mesh_geometry", None) is not None
+    )
+    surface = None if direct_mesh else _visualization_surface(
+        args, axial_samples=16, circumferential_samples=12,
+    )
     if not args.skip_animation:
         # 直管沿 x 方向很长，采用横向窗口可去掉上下无效白边，
         # 同时保持导丝在窗口中的实际显示宽度。
@@ -2292,7 +2539,7 @@ def visualize_results(history: dict[str, np.ndarray], args: argparse.Namespace) 
         # is deliberately enlarged only for viewing: the simulation data and
         # axis labels remain in metres and are not rescaled numerically.
         ax_animation = fig_animation.add_axes([0.015, 0.07, 0.97, 0.87], projection="3d")
-        ax_animation.plot_surface(X, Y, Z, color="lightsteelblue", alpha=0.18, linewidth=0)
+        _draw_vessel(ax_animation, args, surface)
         rod_line, = ax_animation.plot([], [], [], color="tab:blue", lw=1.8, label="guidewire")
         contact_scatter = ax_animation.scatter([], [], [], c="magenta", s=18, label="contact")
         ax_animation.set(
@@ -2407,6 +2654,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backend", choices=("cpp", "python"), default=BACKEND_DEFAULT)
     parser.add_argument("--contact-type", choices=("tube", "mesh"), default=CONTACT_TYPE_DEFAULT)
     parser.add_argument("--mesh-obj", type=Path, default=MESH_OBJ_DEFAULT, help="OBJ or ASCII/binary STL protection surface")
+    parser.add_argument(
+        "--centerline-csv", type=Path, default=CENTERLINE_CSV_DEFAULT,
+        help="optional x,y,z centerline CSV; requires --contact-type mesh",
+    )
     parser.add_argument("--total-length", type=float, default=TOTAL_LENGTH)
     parser.add_argument("--diameter", type=float, default=DIAMETER)
     parser.add_argument("--density", type=float, default=MATERIAL_DENSITY)
@@ -2479,6 +2730,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--history-save-interval", type=int, default=HISTORY_SAVE_INTERVAL)
     parser.add_argument(
+        "--prebalance", action=argparse.BooleanOptionalAction, default=None,
+        help="relax at zero tip displacement before the initial pulse; defaults on for centerline mode",
+    )
+    parser.add_argument(
+        "--prebalance-max-steps", type=int, default=MAX_SETTLE_STEPS,
+        help="maximum held-tip relaxation steps during curved initialization",
+    )
+    parser.add_argument(
         "--device", choices=("auto", "cpu", "cuda"), default=DEVICE_DEFAULT,
         help="calculation device; the default comes from DEVICE_DEFAULT in the parameter section",
     )
@@ -2524,6 +2783,26 @@ def parse_args() -> argparse.Namespace:
     args.ki_active = args.Ki
     args.torch_device = resolve_device(args.device)
     args.mesh_obj = args.mesh_obj.expanduser().resolve()
+    if args.centerline_csv is not None:
+        args.centerline_csv = args.centerline_csv.expanduser().resolve()
+        if args.contact_type != "mesh":
+            parser.error("--centerline-csv requires --contact-type mesh")
+        if not args.centerline_csv.is_file():
+            parser.error(f"centerline CSV does not exist: {args.centerline_csv}")
+        try:
+            args.centerline = Centerline3D.from_csv(args.centerline_csv)
+        except ValueError as error:
+            parser.error(str(error))
+        if args.total_length > args.centerline.length + 2.0e-12 * max(1.0, args.centerline.length):
+            parser.error("centerline is shorter than --total-length")
+        if args.tip_total_displacement >= args.total_length:
+            parser.error("tip-total-displacement must be smaller than total-length in centerline mode")
+    else:
+        args.centerline = None
+    if args.prebalance is None:
+        args.prebalance = args.centerline is not None
+    if args.prebalance_max_steps <= 0:
+        parser.error("prebalance-max-steps must be positive")
     if args.contact_type == "mesh" and not args.mesh_obj.is_file():
         parser.error(f"mesh OBJ/STL does not exist: {args.mesh_obj}")
     if args.backend == "cpp" and args.device == "auto":

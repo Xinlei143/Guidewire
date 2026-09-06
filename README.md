@@ -108,6 +108,47 @@ conda run --no-capture-output -n pendulum-rl python -u \
   --device cuda --pulse-seed 42 --no-show
 ```
 
+### 2.3 与 v4 默认截面一致的 90° 三维圆弧血管
+
+仓库提供一对由同一确定性脚本生成的几何输入：
+
+```text
+tube_obj/arc90_L1p5m_wallR60mm_protectionR50mm_64sides_axial256.obj
+tube_obj/arc90_L1p5m_centerline_800.csv
+```
+
+CSV 必须使用 `x,y,z` 表头，单位为 m，点序从入口到出口。中轴线继续严格采用
+2-D 默认算例：长度为 1.5 m、转角为 90°、弦长修正半径为
+`0.9549298123336835 m`。截面改用 v4 默认尺寸，实体管腔
+半径为 60 mm；OBJ 中名称含 `protection` 的接触面半径为 50 mm，与 v4 默认
+直管截面一致，并且已经编码了
+10 mm 安全距离。因此 mesh runtime 不会再将 `--safe-distance` 偏移第二次。
+
+曲管模式由 `--centerline-csv` 显式启用，不改变无参数运行的直管默认行为。导丝
+沿中轴线初始化，先在零内缩、两端固定条件下预平衡，然后在 Bishop 局部法平面
+施加三维随机脉冲；末端压缩位置沿中轴线弧长回退。
+
+300 节点、与 2-D 参数对齐的验证命令为：
+
+```bash
+MPLBACKEND=Agg MPLCONFIGDIR=/tmp/softrobot-mplconfig \
+conda run --no-capture-output -n pendulum-rl python -u \
+  rod_soft_contact_PI_dynamic_quasi_static_3d_v4.py \
+  --backend cpp --device cpu --contact-type mesh \
+  --mesh-obj tube_obj/arc90_L1p5m_wallR60mm_protectionR50mm_64sides_axial256.obj \
+  --centerline-csv tube_obj/arc90_L1p5m_centerline_800.csv \
+  --num-nodes 300 --tube-radius 0.06 --safe-distance 0.01 \
+  --Kp 3500 --Ki 100 --dt 0.005 \
+  --tip-total-displacement 0.12 --num-load-steps 20 \
+  --pulse-seed 7 --prebalance --skip-animation --no-show
+```
+
+需要重新生成资产时执行：
+
+```bash
+conda run -n pendulum-rl python tools/generate_arc_vessel_3d.py
+```
+
 省略 `--backend` 和 `--contact-type` 时，默认分别为 `cpp` 和 `tube`。C++ 后端
 不能配合 `--device cuda`；需要 GPU 时使用 Python 后端。
 
@@ -162,9 +203,9 @@ conda run --no-capture-output -n pendulum-rl python -u \
 | 圆管 | `--tube-radius` | `0.06` | 管内半径 |
 | 圆管/网格 | `--safe-distance` | `0.01` | 接触保护层厚度 |
 | PI | `--Kp` / `--Ki` | `3000` / `100` | 接触比例、积分增益 |
-| 时间步 | `--dt` | `0.1` | 隐式 Euler/松弛步长，不等同于真实加载时间 |
+| 时间步 | `--dt` | `0.05` | 隐式 Euler/松弛步长，不等同于真实加载时间 |
 | 续加载 | `--tip-total-displacement` | `0.09` | 末端总压缩位移，沿 `-x` |
-| 续加载 | `--num-load-steps` | `10` | 总位移分成的载荷步数 |
+| 续加载 | `--num-load-steps` | `20` | 总位移分成的载荷步数 |
 | 续加载 | `--ramp-mode` | `adaptive` | 自适应或固定末端 ramp |
 | 脉冲 | `--pulse-count-min/max` | `4` / `8` | 随机脉冲节点数量范围 |
 | 脉冲 | `--pulse-force-min/max` | `0.02` / `0.07` | 随机脉冲力幅值范围，N |
@@ -172,6 +213,9 @@ conda run --no-capture-output -n pendulum-rl python -u \
 | 复现 | `--pulse-seed` | 未设置 | 设置整数可复现实验；省略则每次重新随机 |
 | 输出 | `--output-prefix` | 自动命名 | 指定 NPZ 文件路径前缀 |
 | 显示 | `--no-show` | 否 | 不弹出窗口，但仍保存最终 PNG |
+
+曲管模式另外使用 `--centerline-csv`、`--prebalance/--no-prebalance` 和
+`--prebalance-max-steps`。提供中轴线时预平衡默认开启；直管模式默认不开启。
 
 脉冲有两种互斥用法：
 

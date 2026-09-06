@@ -398,6 +398,53 @@ def test_cpp_cached_and_legacy_steps_remain_equivalent_over_repeated_steps():
         ))
 
 
+def test_cpp_prescribed_cached_accepts_full_3d_tip_target():
+    nodes = 8
+    length = 0.7
+    rest = np.full(nodes - 1, length / (nodes - 1), dtype=np.float64)
+    masses = np.full(nodes, 0.01, dtype=np.float64)
+    initial = np.zeros((nodes, 3), dtype=np.float64)
+    initial[:, 0] = np.linspace(0.0, length, nodes)
+    prescribed = initial.copy()
+    prescribed[-1] += np.array((-0.001, 0.002, 0.003))
+    core = _core(nodes)
+    result = core.implicit_euler_step_prescribed_cached(
+        initial, np.zeros_like(initial), np.zeros(nodes), prescribed,
+        np.zeros_like(initial), True, 0.05, 20, 1e-7, 1e-10, 100.0,
+    )
+    np.testing.assert_allclose(result["positions"][-1], prescribed[-1], atol=0.0, rtol=0.0)
+    np.testing.assert_allclose(
+        result["velocities"][-1], (prescribed[-1] - initial[-1]) / 0.05,
+        atol=1e-15, rtol=1e-15,
+    )
+
+
+def test_cpp_legacy_scalar_and_full_prescribed_interfaces_match():
+    nodes = 8
+    length = 0.7
+    rest = np.full(nodes - 1, length / (nodes - 1), dtype=np.float64)
+    masses = np.full(nodes, 0.01, dtype=np.float64)
+    initial = np.zeros((nodes, 3), dtype=np.float64)
+    initial[:, 0] = np.linspace(0.0, length, nodes)
+    pulse = np.zeros_like(initial)
+    displacement = 0.001
+    prescribed = initial.copy()
+    prescribed[-1, 0] -= displacement
+    legacy = _core(nodes).implicit_euler_step_cached(
+        initial, np.zeros_like(initial), np.zeros(nodes), initial, pulse,
+        True, displacement, 0.05, 20, 1e-7, 1e-10, 100.0,
+    )
+    generalized = _core(nodes).implicit_euler_step_prescribed_cached(
+        initial, np.zeros_like(initial), np.zeros(nodes), prescribed, pulse,
+        True, 0.05, 20, 1e-7, 1e-10, 100.0,
+    )
+    for key in (
+        "positions", "velocities", "integrals", "contact_force",
+        "contact_weight", "contact_error", "contact_distance",
+    ):
+        np.testing.assert_array_equal(np.asarray(generalized[key]), np.asarray(legacy[key]))
+
+
 def test_v4_no_argument_defaults_to_auto_device_for_cpp(monkeypatch):
     monkeypatch.setattr(v4.sys, "argv", ["rod_soft_contact_PI_dynamic_quasi_static_3d_v4.py"])
     parsed = v4._parse_args_with_backend()
