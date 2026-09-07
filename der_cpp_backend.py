@@ -133,6 +133,12 @@ class DERCore:
             raise ValueError("mesh geometry arrays must be C-contiguous")
         self._impl.configure_mesh(tri, nor, ids)
 
+    def configure_curved_tube(self, arc_radius):
+        arc_radius = float(arc_radius)
+        if not np.isfinite(arc_radius) or arc_radius <= 0.0:
+            raise ValueError("arc_radius must be finite and positive")
+        self._impl.configure_curved_tube(arc_radius)
+
     def implicit_euler_step(self, positions, velocities, *args):
         """Run one step using either the legacy or cached production signature.
 

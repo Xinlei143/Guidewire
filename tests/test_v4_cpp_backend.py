@@ -284,6 +284,40 @@ def test_cpp_contact_kernel_uses_active_ki_and_custom_constants():
     np.testing.assert_allclose(actual["new_integrals"], reference_integrals.numpy(), rtol=1e-9, atol=1e-10)
 
 
+def test_cpp_curved_tube_contact_matches_python_force_and_jacobian():
+    nodes = 6
+    radius = 0.9549298123336835
+    core = backend.DERCore(
+        np.full(nodes - 1, 1.5 / (nodes - 1), dtype=np.float64),
+        np.full(nodes, 0.01, dtype=np.float64),
+        100.0, 0.01, 0.02, 0.05, 0.01, 3500.0, 100.0, 20.0, 5.0, 0.05,
+        v4.CONTACT_SMOOTH_LENGTH, v4.DIRECTION_EPSILON,
+    )
+    core.configure_curved_tube(radius)
+    theta = np.linspace(0.1, 1.4, nodes)
+    centers = np.column_stack((
+        radius * np.sin(theta), np.zeros(nodes), radius * (1.0 - np.cos(theta)),
+    ))
+    outward = np.column_stack((np.sin(theta), np.zeros(nodes), -np.cos(theta)))
+    positions = np.ascontiguousarray(centers + outward * np.linspace(0.0398, 0.041, nodes)[:, None])
+    positions[:, 1] = np.linspace(-0.002, 0.002, nodes)
+    integrals = np.linspace(0.0, 2.0e-5, nodes, dtype=np.float64)
+    previous = np.linspace(0.0, 3.0e-4, nodes, dtype=np.float64)
+    args = type("Args", (), dict(
+        arc_radius=radius, tube_radius=0.05, safe_distance=0.01,
+        dt_active=0.005, Kp=3500.0, ki_active=100.0, max_pi_force=20.0,
+        integral_leak_rate=5.0, max_integral_state=0.05,
+    ))()
+    pattern = v4.get_assembly_pattern(torch.zeros((nodes, 3), dtype=torch.bool))
+    reference_force, reference_jac = v4.assemble_contact_batched(
+        torch.tensor(positions), torch.tensor(integrals), torch.tensor(previous), pattern,
+        type("CurvedArgs", (type(args),), {"contact_type": "curved-tube"})(),
+    )
+    actual = core.contact_kernel(positions, integrals, previous, 0.005, 100.0)
+    np.testing.assert_allclose(actual["force"].reshape(-1), reference_force.numpy(), rtol=2e-8, atol=2e-10)
+    np.testing.assert_allclose(actual["jacobian"], reference_jac.numpy(), rtol=2e-8, atol=2e-10)
+
+
 def test_cpp_implicit_step_reports_profile_counters():
     nodes = 8
     positions = np.zeros((nodes, 3), dtype=np.float64)

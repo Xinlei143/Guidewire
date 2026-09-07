@@ -39,6 +39,8 @@ conda run --no-capture-output -n pendulum-rl python -u \
 |---|---|---|---|
 | `cpp` | `tube` | 默认推荐；CPU 上运行 DER/Newton 热路径 | 仅 CPU、`float64` |
 | `python` | `tube` | Python 参考实现、结果 A/B 对照 | CPU 或 CUDA |
+| `cpp` | `curved-tube` | 解析光滑 90° 圆弧血管，无需 OBJ | 仅 CPU、`float64` |
+| `python` | `curved-tube` | 光滑曲管参考实现与 Jacobian 对照 | CPU 或 CUDA |
 | `cpp` | `mesh` | OBJ 三角网格接触的 CPU 运行 | 仅 CPU、`float64` |
 | `python` | `mesh` | OBJ 网格参考实现或 CUDA 运行 | CPU 或 CUDA |
 
@@ -148,6 +150,27 @@ conda run --no-capture-output -n pendulum-rl python -u \
 ```bash
 conda run -n pendulum-rl python tools/generate_arc_vessel_3d.py
 ```
+
+### 2.4 不使用 OBJ 的解析光滑曲管
+
+`--contact-type curved-tube` 直接使用与 2-D 弯曲血管脚本相同的默认参数，并将该圆弧嵌入全局 xz 平面（y=0）：
+1.5 m 离散弦长、90° 圆弧、800 点弦长修正半径
+`0.9549298123336835 m`、实体管腔半径 50 mm、10 mm 安全层和 40 mm
+接触保护半径。接触距离是节点到圆弧中轴线的三维解析距离，法向和完整 3×3
+Jacobian 均连续，不读取 `--mesh-obj`，也不受三角面数量或法向跳变影响。
+
+```bash
+MPLBACKEND=Agg MPLCONFIGDIR=/tmp/softrobot-mplconfig \
+conda run --no-capture-output -n pendulum-rl python -u \
+  rod_soft_contact_PI_dynamic_quasi_static_3d_v4.py \
+  --backend cpp --device cpu --contact-type curved-tube \
+  --num-nodes 300 --Kp 3500 --Ki 100 --dt 0.005 \
+  --tip-total-displacement 0.12 --num-load-steps 20 \
+  --pulse-seed 7 --prebalance --skip-animation --no-show
+```
+
+若显式传入 `--tube-radius` 或 `--safe-distance`，可覆盖上述截面默认值；不传时
+`curved-tube` 使用 2-D 的 50/10 mm，而原有直管 `tube` 仍使用 v4 的 60/10 mm。
 
 省略 `--backend` 和 `--contact-type` 时，默认分别为 `cpp` 和 `tube`。C++ 后端
 不能配合 `--device cuda`；需要 GPU 时使用 Python 后端。

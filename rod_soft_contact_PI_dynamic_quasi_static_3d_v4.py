@@ -36,6 +36,10 @@ BACKEND_DEFAULT = "cpp"
 CONTACT_TYPE_DEFAULT = "tube"
 MESH_OBJ_DEFAULT = ROOT / "tube_obj" / "straight_tube_L1p5m_boundaryR50mm_shellR60mm_32sides_axial2.obj"
 CENTERLINE_CSV_DEFAULT = None
+CURVED_TUBE_RADIUS = 50.0e-3
+CURVED_TUBE_SAFE_DISTANCE = 10.0e-3
+CURVED_TUBE_ARC_ANGLE_DEG = 90.0
+CURVED_TUBE_CENTERLINE_NODES = 800
 
 # --- 导丝材料与离散 ---
 TOTAL_LENGTH = 1.5                 # 导丝初始长度；x 轴方向从 0 延伸到该值
@@ -161,6 +165,19 @@ def initialize_rod(
     masses = np.full(num_nodes, total_mass / (num_nodes - 1), dtype=np.float64)
     masses[[0, -1]] *= 0.5
     return positions, np.zeros_like(positions), rest_lengths, masses, np.zeros(num_nodes)
+
+
+def make_2d_default_arc_centerline(total_length: float) -> tuple[Centerline3D, float]:
+    """Return the 2-D default arc embedded in the global x-z plane."""
+    angle = math.radians(CURVED_TUBE_ARC_ANGLE_DEG)
+    intervals = CURVED_TUBE_CENTERLINE_NODES - 1
+    radius = total_length / (2.0 * intervals * math.sin(angle / (2.0 * intervals)))
+    theta = np.linspace(0.0, angle, CURVED_TUBE_CENTERLINE_NODES)
+    points = np.column_stack((
+        radius * np.sin(theta), np.zeros_like(theta), radius * (1.0 - np.cos(theta)),
+    ))
+    cumulative = np.concatenate(([0.0], np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1))))
+    return Centerline3D(np.ascontiguousarray(points), np.ascontiguousarray(cumulative)), radius
 
 
 def parse_float_list(text: str) -> list[float]:
@@ -488,6 +505,43 @@ def _contact_single(
     return force_yz, new_integral, error, weight, z > 0.0, distance
 
 
+def _curved_tube_contact_single(
+    point: torch.Tensor,
+    old_integral: torch.Tensor,
+    previous_error: torch.Tensor,
+    args: argparse.Namespace,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Smooth 3-D tube contact around the 2-D circular-arc centerline."""
+    planar = torch.stack((point[0], point[2] - args.arc_radius))
+    rho = torch.linalg.vector_norm(planar).clamp_min(1.0e-12)
+    nearest = torch.stack((
+        args.arc_radius * planar[0] / rho,
+        torch.zeros((), dtype=point.dtype, device=point.device),
+        args.arc_radius + args.arc_radius * planar[1] / rho,
+    ))
+    offset = point - nearest
+    radial = torch.linalg.vector_norm(offset)
+    distance = args.tube_radius - radial
+    z = radial - (args.tube_radius - args.safe_distance)
+    beta = 1.0 / CONTACT_SMOOTH_LENGTH
+    error = F.softplus(z, beta=beta)
+    weight = torch.sigmoid(beta * z)
+    candidate = torch.clamp(
+        weight * (old_integral + error * args.dt_active)
+        + (1.0 - weight) * old_integral * math.exp(-args.integral_leak_rate * args.dt_active),
+        0.0, args.max_integral_state,
+    )
+    unsaturated = args.Kp * error + args.ki_active * candidate
+    stop_growth = ((args.ki_active > 0.0) & (unsaturated >= args.max_pi_force) & (candidate > old_integral)) | (
+        (args.ki_active > 0.0) & (error < previous_error)
+        & (args.ki_active * old_integral > args.Kp * error) & (candidate > old_integral)
+    )
+    new_integral = torch.where(stop_growth, old_integral, candidate)
+    magnitude = torch.clamp(args.Kp * error + args.ki_active * new_integral, 0.0, args.max_pi_force)
+    force = -offset * magnitude / torch.sqrt(radial.square() + DIRECTION_EPSILON**2)
+    return force, new_integral, error, weight, z > 0.0, distance
+
+
 def _ensure_mesh_geometry(args: argparse.Namespace, device: torch.device) -> mesh_contact_v4.MeshGeometry:
     backend = getattr(args, "mesh_backend", None)
     if backend is None or backend.obj_file != args.mesh_obj or backend.device != device:
@@ -558,6 +612,11 @@ def contact_quantities(
             direction_epsilon=DIRECTION_EPSILON,
         )
         return force, state.new_integrals, state.active, state.weights, state.errors, state.distances
+    if getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) == "curved-tube":
+        values = torch.func.vmap(_curved_tube_contact_single, in_dims=(0, 0, 0, None))(
+            positions, integrals, previous_errors, args,
+        )
+        return values[0], values[1], values[4], values[3], values[2], values[5]
     values = torch.func.vmap(_contact_single, in_dims=(0, 0, 0, None, None, None, None, None, None, None, None))(
         positions[:, 1:], integrals, previous_errors, args.dt_active, args.tube_radius,
         args.safe_distance, args.Kp, args.ki_active, args.max_pi_force,
@@ -587,6 +646,14 @@ def assemble_contact_batched(
             direction_epsilon=DIRECTION_EPSILON,
         )
         return force.reshape(-1)[pattern.free_indices], blocks
+    if getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) == "curved-tube":
+        def force_aux(point: torch.Tensor, old_i: torch.Tensor, previous: torch.Tensor):
+            force = _curved_tube_contact_single(point, old_i, previous, args)[0]
+            return force, force
+        blocks, values = torch.func.vmap(
+            torch.func.jacrev(force_aux, argnums=0, has_aux=True)
+        )(positions, integrals, previous_errors)
+        return values.reshape(-1)[pattern.free_indices], blocks
     """Return the contact force on free coordinates and its per-node y/z
     Jacobian blocks (num_nodes, 2, 2), computed in a single batched pass."""
     def force_yz_aux(yz: torch.Tensor, old_i: torch.Tensor, previous: torch.Tensor):
@@ -634,6 +701,9 @@ def assemble_contact_analytic(
             direction_epsilon=DIRECTION_EPSILON,
         )
         return force.reshape(-1)[pattern.free_indices], blocks
+
+    if getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) == "curved-tube":
+        return assemble_contact_batched(positions, integrals, previous_errors, pattern, args)
 
     yz = positions[:, 1:]
     radial = torch.linalg.vector_norm(yz, dim=1)
@@ -728,6 +798,12 @@ def compute_contact_error(positions: torch.Tensor, args: argparse.Namespace) -> 
     if getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) == "mesh":
         details = _mesh_details(positions, args)
         return torch.clamp(-details.clearance, min=0.0)
+    if getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) == "curved-tube":
+        zero = torch.zeros(len(positions), dtype=positions.dtype, device=positions.device)
+        values = torch.func.vmap(_curved_tube_contact_single, in_dims=(0, 0, 0, None))(
+            positions, zero, zero, args,
+        )
+        return torch.clamp(args.safe_distance - values[5], min=0.0)
     return compute_protection_error(positions, args.tube_radius, args.safe_distance)
 
 
@@ -962,7 +1038,7 @@ def residual_and_jacobian(
         return residual, None, positions
     diagonal_add = (free_masses / args.dt_active**2 + args.damping / args.dt_active).reshape(-1, 3)
     system.diagonal.diagonal(dim1=1, dim2=2).add_(diagonal_add)
-    if getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) == "mesh":
+    if getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) in ("mesh", "curved-tube"):
         system.diagonal.add_(-contact_blocks[free_start:free_end])
     else:
         system.diagonal[:, 1:, 1:].add_(-contact_blocks[free_start:free_end])
@@ -1128,6 +1204,8 @@ def _get_core(args: argparse.Namespace, rest_lengths: torch.Tensor,
                 np.ascontiguousarray(geometry.normals.detach().cpu().numpy(), dtype=np.float64),
                 np.ascontiguousarray(geometry.triangle_obj_ids.detach().cpu().numpy(), dtype=np.int64),
             )
+        elif getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) == "curved-tube":
+            core.configure_curved_tube(args.arc_radius)
         args._cpp_core = core
     return core
 
@@ -1991,8 +2069,9 @@ def run_simulation(args: argparse.Namespace) -> dict[str, np.ndarray]:
             "centerline_csv": np.asarray(str(args.centerline_csv)),
             "centerline_points": args.centerline.points.copy(),
             "centerline_cumulative_s": args.centerline.cumulative_s.copy(),
-            "centerline_mesh_clearances": np.asarray(args.centerline_mesh_clearances),
         })
+        if getattr(args, "centerline_mesh_clearances", None) is not None:
+            history_np["centerline_mesh_clearances"] = np.asarray(args.centerline_mesh_clearances)
     dt_timings = getattr(args, "dt_timings", None) or []
     if dt_timings:
         dt_phases = np.asarray([rec["phase"] for rec in dt_timings])
@@ -2174,6 +2253,26 @@ def _analytic_tube_surface(
     return X, Y, Z
 
 
+def _curved_tube_surface(
+    args: argparse.Namespace, *, axial_samples: int,
+    circumferential_samples: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return the exact smooth circular sweep used by curved-tube contact."""
+    theta = np.linspace(0.0, math.radians(args.arc_angle_deg), axial_samples)
+    phi = np.linspace(0.0, 2.0 * np.pi, circumferential_samples, endpoint=False)
+    centers = np.column_stack((
+        args.arc_radius * np.sin(theta),
+        np.zeros_like(theta),
+        args.arc_radius * (1.0 - np.cos(theta)),
+    ))
+    outward = np.column_stack((np.sin(theta), np.zeros_like(theta), -np.cos(theta)))
+    rings = centers[:, None, :] + args.tube_radius * (
+        np.cos(phi)[None, :, None] * outward[:, None, :]
+        + np.sin(phi)[None, :, None] * np.array([0.0, 1.0, 0.0])[None, None, :]
+    )
+    return rings[:, :, 0], rings[:, :, 1], rings[:, :, 2]
+
+
 def _mesh_visualization_surface(
     geometry: mesh_contact_v4.MeshGeometry, *, axial_samples: int,
     circumferential_samples: int,
@@ -2293,7 +2392,12 @@ def _visualization_surface(
     cached = getattr(args, "_visualization_surface_cache", None)
     if cached is not None and cached[0] == cache_key:
         return cached[1]
-    if getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) == "mesh" and geometry is not None:
+    if getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) == "curved-tube":
+        surface = _curved_tube_surface(
+            args, axial_samples=axial_samples,
+            circumferential_samples=circumferential_samples,
+        )
+    elif getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) == "mesh" and geometry is not None:
         try:
             surface = _mesh_visualization_surface(
                 geometry, axial_samples=axial_samples,
@@ -2367,6 +2471,9 @@ def _draw_vessel(ax, args: argparse.Namespace, surface=None) -> None:
         return
     assert surface is not None
     ax.plot_surface(*surface, color="lightsteelblue", alpha=0.18, linewidth=0)
+    centerline = getattr(args, "centerline", None)
+    if centerline is not None:
+        ax.plot(*centerline.points.T, color="0.35", ls="--", lw=1.0, label="centerline")
 
 
 def _set_visualization_bounds(
@@ -2374,14 +2481,14 @@ def _set_visualization_bounds(
     args: argparse.Namespace,
 ) -> None:
     """Use proxy-and-rod bounds for mesh mode, preserving tube-mode framing."""
-    if getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) != "mesh":
+    if getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) == "tube":
         ax.set_xlim(0.0, args.total_length)
         ax.set_ylim(-1.15 * args.tube_radius, 1.15 * args.tube_radius)
         ax.set_zlim(-1.15 * args.tube_radius, 1.15 * args.tube_radius)
         ax.set_box_aspect((args.total_length, 6 * args.tube_radius, 6 * args.tube_radius))
         return
     geometry = getattr(args, "mesh_geometry", None)
-    if geometry is not None:
+    if getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) == "mesh" and geometry is not None:
         vessel_coordinates = geometry.vertices.detach().cpu().numpy()
     else:
         assert surface is not None
@@ -2427,9 +2534,11 @@ def create_final_result_figure(history: dict[str, np.ndarray], args: argparse.Na
         ax.scatter(*positions[-1, active].T, c="magenta", s=18, label="final contact")
     ax.set(
         xlabel="x (m)", ylabel="y (m)", zlabel="z (m)",
-        title=("Final guidewire deformation in the imported vessel mesh"
-               if getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) == "mesh"
-               else "Final guidewire deformation in the straight cylindrical tube"),
+        title={
+            "mesh": "Final guidewire deformation in the imported vessel mesh",
+            "curved-tube": "Final guidewire deformation in the smooth curved tube",
+            "tube": "Final guidewire deformation in the straight cylindrical tube",
+        }[getattr(args, "contact_type", CONTACT_TYPE_DEFAULT)],
     )
     _set_visualization_bounds(ax, positions, surface, args)
     ax.view_init(elev=18, azim=-64)
@@ -2652,7 +2761,7 @@ def self_test(args: argparse.Namespace) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backend", choices=("cpp", "python"), default=BACKEND_DEFAULT)
-    parser.add_argument("--contact-type", choices=("tube", "mesh"), default=CONTACT_TYPE_DEFAULT)
+    parser.add_argument("--contact-type", choices=("tube", "mesh", "curved-tube"), default=CONTACT_TYPE_DEFAULT)
     parser.add_argument("--mesh-obj", type=Path, default=MESH_OBJ_DEFAULT, help="OBJ or ASCII/binary STL protection surface")
     parser.add_argument(
         "--centerline-csv", type=Path, default=CENTERLINE_CSV_DEFAULT,
@@ -2690,7 +2799,7 @@ def parse_args() -> argparse.Namespace:
             "omit both for fully-random pulses"
         ),
     )
-    parser.add_argument("--tube-radius", type=float, default=TUBE_RADIUS)
+    parser.add_argument("--tube-radius", type=float, default=None)
     parser.add_argument("--safe-distance", type=float, default=SAFE_DISTANCE)
     parser.add_argument("--Kp", type=float, default=KP)
     parser.add_argument("--Ki", type=float, default=KI)
@@ -2755,6 +2864,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--animation-fps", type=float, default=30.0)
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
+    if args.tube_radius is None:
+        args.tube_radius = CURVED_TUBE_RADIUS if args.contact_type == "curved-tube" else TUBE_RADIUS
     if args.num_nodes < 4 or args.total_length <= 0 or args.diameter <= 0 or args.density <= 0:
         parser.error("length, diameter, density must be positive and num-nodes must be at least 4")
     if not 0.0 < args.safe_distance < args.tube_radius:
@@ -2797,8 +2908,16 @@ def parse_args() -> argparse.Namespace:
             parser.error("centerline is shorter than --total-length")
         if args.tip_total_displacement >= args.total_length:
             parser.error("tip-total-displacement must be smaller than total-length in centerline mode")
+    elif args.contact_type == "curved-tube":
+        args.centerline, args.arc_radius = make_2d_default_arc_centerline(args.total_length)
+        args.arc_angle_deg = CURVED_TUBE_ARC_ANGLE_DEG
+        args.centerline_mesh_clearances = None
+        if args.tip_total_displacement >= args.total_length:
+            parser.error("tip-total-displacement must be smaller than total-length in curved-tube mode")
     else:
         args.centerline = None
+        args.arc_radius = None
+        args.arc_angle_deg = None
     if args.prebalance is None:
         args.prebalance = args.centerline is not None
     if args.prebalance_max_steps <= 0:

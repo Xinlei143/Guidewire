@@ -107,6 +107,79 @@ def _curved_args(monkeypatch, *extra):
     return v4._parse_args_with_backend()
 
 
+def _smooth_curved_args(monkeypatch, backend="python", *extra):
+    argv = [
+        "v4", "--backend", backend, "--device", "cpu",
+        "--contact-type", "curved-tube", "--num-nodes", "12",
+        "--pulse-count-min", "4", "--pulse-count-max", "4",
+        "--pulse-seed", "7", *extra,
+    ]
+    monkeypatch.setattr(v4.sys, "argv", argv)
+    return v4._parse_args_with_backend()
+
+
+def test_curved_tube_parser_uses_2d_vessel_defaults_without_mesh(monkeypatch):
+    args = _smooth_curved_args(monkeypatch)
+    assert args.contact_type == "curved-tube"
+    assert args.centerline_csv is None
+    assert args.tube_radius == pytest.approx(0.05)
+    assert args.safe_distance == pytest.approx(0.01)
+    assert args.arc_angle_deg == pytest.approx(90.0)
+    assert args.arc_radius == pytest.approx(RADIUS, abs=2e-15)
+    assert args.centerline.length == pytest.approx(1.5, abs=2e-14)
+    np.testing.assert_allclose(args.centerline.points[:, 1], 0.0, atol=0.0)
+    np.testing.assert_allclose(args.centerline.points[-1], (RADIUS, 0.0, RADIUS), atol=2e-15)
+    assert args.prebalance is True
+    assert args.centerline_mesh_clearances is None
+
+
+def test_curved_tube_contact_is_smooth_and_matches_2d_plane(monkeypatch):
+    args = _smooth_curved_args(monkeypatch)
+    args.dt_active = 0.005
+    args.ki_active = args.Ki
+    theta = 0.37
+    centerline = torch.tensor(
+        [args.arc_radius * np.sin(theta), 0.0, args.arc_radius * (1.0 - np.cos(theta))],
+        dtype=torch.float64,
+    )
+    outward = torch.tensor([np.sin(theta), 0.0, -np.cos(theta)], dtype=torch.float64)
+    point = centerline + 0.0402 * outward + torch.tensor([0.0, 0.001, 0.0])
+    old_i = torch.tensor(0.0, dtype=torch.float64)
+    previous = torch.tensor(0.0, dtype=torch.float64)
+
+    force, *_rest, distance = v4._curved_tube_contact_single(point, old_i, previous, args)
+    jacobian = torch.func.jacrev(
+        lambda p: v4._curved_tube_contact_single(p, old_i, previous, args)[0]
+    )(point)
+    assert torch.dot(force, point - centerline) < 0.0
+    assert float(distance) == pytest.approx(0.05 - np.hypot(0.0402, 0.001), abs=2e-12)
+    assert torch.isfinite(jacobian).all()
+    assert torch.max(torch.abs(jacobian - jacobian.T)) < 2.0e-7
+
+    planar = centerline + 0.0402 * outward
+    curved_force = v4._curved_tube_contact_single(planar, old_i, previous, args)[0]
+    signed = torch.linalg.vector_norm(
+        planar[[0, 2]] - torch.tensor([0.0, args.arc_radius], dtype=torch.float64)
+    ) - args.arc_radius
+    assert signed == pytest.approx(0.0402, abs=2e-14)
+    assert torch.dot(curved_force[[0, 2]], outward[[0, 2]]) < 0.0
+    assert curved_force[1] == pytest.approx(0.0, abs=1e-15)
+
+
+def test_curved_tube_visualization_surface_has_2d_default_radius(monkeypatch):
+    args = _smooth_curved_args(monkeypatch)
+    x, y, z = v4._curved_tube_surface(args, axial_samples=25, circumferential_samples=16)
+    assert x.shape == y.shape == z.shape == (25, 16)
+    points = np.stack((x, y, z), axis=-1)
+    theta = np.linspace(0.0, np.pi / 2.0, 25)
+    centerline = np.column_stack((
+        args.arc_radius * np.sin(theta),
+        np.zeros_like(theta),
+        args.arc_radius * (1.0 - np.cos(theta)),
+    ))
+    np.testing.assert_allclose(np.linalg.norm(points - centerline[:, None], axis=2), 0.05, atol=2e-12)
+
+
 def test_parser_enables_opt_in_curved_mode_and_rejects_analytic_contact(monkeypatch):
     args = _curved_args(monkeypatch)
     assert args.centerline_csv == CENTERLINE

@@ -377,6 +377,70 @@ MeshContactValue evaluate_mesh_contact(
   return output;
 }
 
+ContactValue evaluate_curved_tube_contact(
+    const Vec3& point, double old_integral, double previous_error, double dt,
+    double arc_radius, double tube_radius, double safe_distance, double kp,
+    double ki_active, double max_pi_force, double leak_rate,
+    double max_integral_state, double smooth_length, double direction_epsilon) {
+  ContactValue output;
+  const double planar_z = point.z() - arc_radius;
+  const double rho = std::max(std::hypot(point.x(), planar_z), 1.0e-12);
+  const Vec3 nearest(arc_radius * point.x() / rho,
+                     0.0, arc_radius + arc_radius * planar_z / rho);
+  const Vec3 offset = point - nearest;
+  const double radial = offset.norm();
+  const double protection = radial - (tube_radius - safe_distance);
+  const double beta = 1.0 / smooth_length;
+  const double error = softplus(protection, beta);
+  const double error_prime = sigmoid(beta * protection);
+  const double weight_prime = beta * error_prime * (1.0 - error_prime);
+  const double decay = std::exp(-leak_rate * dt);
+  const double accumulated = old_integral + error * dt;
+  const double leaked = old_integral * decay;
+  const double raw_candidate = leaked + error_prime * (accumulated - leaked);
+  const double candidate = std::min(std::max(raw_candidate, 0.0), max_integral_state);
+  const bool candidate_inside = raw_candidate >= 0.0 && raw_candidate <= max_integral_state;
+  const double candidate_prime = candidate_inside
+      ? weight_prime * (accumulated - leaked) + dt * error_prime * error_prime : 0.0;
+  const double unsaturated = kp * error + ki_active * candidate;
+  const bool stop_growth =
+      (ki_active > 0.0 && unsaturated >= max_pi_force && candidate > old_integral) ||
+      (ki_active > 0.0 && error < previous_error &&
+       ki_active * old_integral > kp * error && candidate > old_integral);
+  const double integral = stop_growth ? old_integral : candidate;
+  const double integral_prime = stop_growth ? 0.0 : candidate_prime;
+  const double raw_magnitude = kp * error + ki_active * integral;
+  const double magnitude = std::min(std::max(raw_magnitude, 0.0), max_pi_force);
+  const bool magnitude_inside = raw_magnitude >= 0.0 && raw_magnitude <= max_pi_force;
+  const double magnitude_prime = magnitude_inside
+      ? kp * error_prime + ki_active * integral_prime : 0.0;
+
+  Mat3 offset_jacobian = Mat3::Identity();
+  Eigen::Vector2d unit(point.x() / rho, planar_z / rho);
+  const Eigen::Matrix2d correction =
+      (arc_radius / rho) * (Eigen::Matrix2d::Identity() - unit * unit.transpose());
+  offset_jacobian(0, 0) -= correction(0, 0);
+  offset_jacobian(0, 2) -= correction(0, 1);
+  offset_jacobian(2, 0) -= correction(1, 0);
+  offset_jacobian(2, 2) -= correction(1, 1);
+  const double scale = std::sqrt(radial * radial + direction_epsilon * direction_epsilon);
+  output.force = -magnitude * offset / scale;
+  if (radial > 0.0) {
+    const Vec3 distance_gradient = offset_jacobian.transpose() * offset / radial;
+    output.jacobian = -(magnitude / scale) * offset_jacobian
+        + (magnitude * radial / std::pow(scale, 3) - magnitude_prime / scale)
+          * offset * distance_gradient.transpose();
+  } else {
+    output.jacobian = -(magnitude / scale) * offset_jacobian;
+  }
+  output.new_integral = integral;
+  output.error = error;
+  output.weight = error_prime;
+  output.active = protection > 0.0;
+  output.distance = tube_radius - radial;
+  return output;
+}
+
 struct BlockPentaSystem {
   explicit BlockPentaSystem(int count)
       : diagonal(count, Mat3::Zero()),
@@ -649,6 +713,15 @@ void DERCore::configure_mesh(const py::array& triangles, const py::array& normal
   }
   mesh_bvh_.build(mesh_triangles_);
   mesh_enabled_ = !mesh_normals_.empty();
+  curved_tube_enabled_ = false;
+}
+
+void DERCore::configure_curved_tube(double arc_radius) {
+  if (!std::isfinite(arc_radius) || arc_radius <= 0.0)
+    throw py::value_error("arc_radius must be finite and positive");
+  arc_radius_ = arc_radius;
+  curved_tube_enabled_ = true;
+  mesh_enabled_ = false;
 }
 
 py::tuple DERCore::stretch_kernel(const py::array& positions,
@@ -744,7 +817,7 @@ py::dict DERCore::contact_kernel(const py::array& positions,
   const auto* x = static_cast<const double*>(p.ptr);
   const auto* oi = static_cast<const double*>(old_i.ptr);
   const auto* pe = static_cast<const double*>(previous.ptr);
-  if (mesh_enabled_) {
+  if (mesh_enabled_ || curved_tube_enabled_) {
     py::array_t<double> force(py::array::ShapeContainer(
         std::vector<py::ssize_t>{nodes, 3}));
     py::array_t<double> jacobian(py::array::ShapeContainer(
@@ -761,21 +834,33 @@ py::dict DERCore::contact_kernel(const py::array& positions,
     auto* di = static_cast<double*>(distances.request().ptr);
     auto* ti = static_cast<std::int64_t*>(triangle_ids.request().ptr);
     for (ssize_t n = 0; n < nodes; ++n) {
-      const MeshContactValue value = evaluate_mesh_contact(
-          Vec3(x[3 * n], x[3 * n + 1], x[3 * n + 2]), oi[n], pe[n], dt,
-          kp_, ki_active, max_pi_force_, leak_rate_, max_integral_state_,
-          contact_smooth_length_, mesh_triangles_, mesh_normals_, mesh_triangle_ids_,
-          mesh_bvh_);
-      for (int k = 0; k < 3; ++k) {
-        f[3 * n + k] = value.value.force(k);
-        for (int l = 0; l < 3; ++l) j[9 * n + 3 * k + l] = value.value.jacobian(k, l);
+      ContactValue contact;
+      std::int64_t triangle_id = -1;
+      if (mesh_enabled_) {
+        const MeshContactValue value = evaluate_mesh_contact(
+            Vec3(x[3 * n], x[3 * n + 1], x[3 * n + 2]), oi[n], pe[n], dt,
+            kp_, ki_active, max_pi_force_, leak_rate_, max_integral_state_,
+            contact_smooth_length_, mesh_triangles_, mesh_normals_, mesh_triangle_ids_,
+            mesh_bvh_);
+        contact = value.value;
+        triangle_id = value.triangle_id;
+      } else {
+        contact = evaluate_curved_tube_contact(
+            Vec3(x[3 * n], x[3 * n + 1], x[3 * n + 2]), oi[n], pe[n], dt,
+            arc_radius_, tube_radius_, safe_distance_, kp_, ki_active,
+            max_pi_force_, leak_rate_, max_integral_state_, contact_smooth_length_,
+            direction_epsilon_);
       }
-      ni[n] = value.value.new_integral;
-      er[n] = value.value.error;
-      we[n] = value.value.weight;
-      ac[n] = value.value.active;
-      di[n] = value.value.distance;
-      ti[n] = value.triangle_id;
+      for (int k = 0; k < 3; ++k) {
+        f[3 * n + k] = contact.force(k);
+        for (int l = 0; l < 3; ++l) j[9 * n + 3 * k + l] = contact.jacobian(k, l);
+      }
+      ni[n] = contact.new_integral;
+      er[n] = contact.error;
+      we[n] = contact.weight;
+      ac[n] = contact.active;
+      di[n] = contact.distance;
+      ti[n] = triangle_id;
     }
     py::dict result;
     result["force"] = force;
@@ -966,6 +1051,11 @@ py::dict DERCore::implicit_euler_step_prescribed(
           max_pi_force_, leak_rate_, max_integral_state_, contact_smooth_length_,
           mesh_triangles_, mesh_normals_, mesh_triangle_ids_, mesh_bvh_);
       previous_error(n) = value.value.error;
+    } else if (curved_tube_enabled_) {
+      previous_error(n) = evaluate_curved_tube_contact(
+          old_full.segment<3>(3 * n), old_integral[n], 0.0, dt, arc_radius_,
+          tube_radius_, safe_distance_, kp_, ki_active, max_pi_force_, leak_rate_,
+          max_integral_state_, contact_smooth_length_, direction_epsilon_).error;
     } else {
       const double radial = std::hypot(old_full(3 * n + 1), old_full(3 * n + 2));
       previous_error(n) = softplus(radial - (tube_radius_ - safe_distance_), beta);
@@ -1072,6 +1162,16 @@ py::dict DERCore::implicit_euler_step_prescribed(
             mesh_bvh_, workspace.mesh_frozen_faces[n]);
         contact_force.segment<3>(3 * n) = value.value.force;
         if (with_jacobian) contact_jac[n] = value.value.jacobian;
+        continue;
+      }
+      if (curved_tube_enabled_) {
+        const ContactValue value = evaluate_curved_tube_contact(
+            full.segment<3>(3 * n), old_integral[n], previous_error(n), dt,
+            arc_radius_, tube_radius_, safe_distance_, kp_, ki_active,
+            max_pi_force_, leak_rate_, max_integral_state_, contact_smooth_length_,
+            direction_epsilon_);
+        contact_force.segment<3>(3 * n) = value.force;
+        if (with_jacobian) contact_jac[n] = value.jacobian;
         continue;
       }
       const double y = full(3 * n + 1), z = full(3 * n + 2);

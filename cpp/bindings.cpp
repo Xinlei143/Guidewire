@@ -20,6 +20,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("bending_kernel", &der::DERCore::bending_kernel)
       .def("configure_mesh", &der::DERCore::configure_mesh,
            py::arg("triangles"), py::arg("normals"), py::arg("triangle_ids"))
+      .def("configure_curved_tube", &der::DERCore::configure_curved_tube,
+           py::arg("arc_radius"))
       .def("contact_kernel",
            [](der::DERCore& self, const py::array& positions,
               const py::array& integrals, const py::array& previous_errors,

@@ -36,6 +36,7 @@ class DERCore {
                           double ki_active) const;
   void configure_mesh(const py::array& triangles, const py::array& normals,
                       const py::array& triangle_ids);
+  void configure_curved_tube(double arc_radius);
   double nominal_ki() const { return ki_; }
   py::dict implicit_euler_step(
       const py::array& positions, const py::array& velocities,
@@ -81,6 +82,8 @@ class DERCore {
   double contact_smooth_length_;
   double direction_epsilon_;
   bool mesh_enabled_ = false;
+  bool curved_tube_enabled_ = false;
+  double arc_radius_ = 0.0;
   std::vector<Vec3> mesh_triangles_;
   std::vector<Vec3> mesh_normals_;
   std::vector<std::int64_t> mesh_triangle_ids_;
