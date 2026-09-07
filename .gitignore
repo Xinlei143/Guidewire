@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
+*.npz
 
 .vscode/browse.vc.db*
 .vscode/*.db
