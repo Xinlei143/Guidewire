@@ -11,15 +11,15 @@ import numpy as np
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_OBJ = ROOT / "tube_obj" / "arc90_L1p5m_wallR60mm_protectionR50mm_64sides_axial256.obj"
-DEFAULT_CENTERLINE = ROOT / "tube_obj" / "arc90_L1p5m_centerline_800.csv"
+DEFAULT_OBJ = ROOT / "tube_obj" / "arc90_L1p5m_xz_wallR60mm_protectionR50mm_64sides_axial256.obj"
+DEFAULT_CENTERLINE = ROOT / "tube_obj" / "arc90_L1p5m_xz_centerline_800.csv"
 
 
 def chord_corrected_radius(length: float, angle: float, node_count: int) -> float:
     return length / (2.0 * (node_count - 1) * math.sin(angle / (2.0 * (node_count - 1))))
 
 
-def arc_centers(radius: float, angle: float, count: int, plane: str = "xy") -> np.ndarray:
+def arc_centers(radius: float, angle: float, count: int, plane: str = "xz") -> np.ndarray:
     theta = np.linspace(0.0, angle, count)
     bend = radius * (1.0 - np.cos(theta))
     if plane == "xz":
@@ -36,7 +36,7 @@ def write_centerline(path: Path, centers: np.ndarray) -> None:
 
 def rings(
     radius: float, angle: float, count: int, cross_radius: float, sides: int,
-    plane: str = "xy",
+    plane: str = "xz",
 ) -> np.ndarray:
     theta = np.linspace(0.0, angle, count)
     centers = arc_centers(radius, angle, count, plane)
@@ -70,7 +70,7 @@ def surface_faces(ring_count: int, sides: int, offset: int, *, reverse: bool) ->
 def write_obj(
     path: Path, *, length: float, angle: float, node_count: int,
     wall_radius: float, safe_distance: float, axial_segments: int, sides: int,
-    plane: str = "xy",
+    plane: str = "xz",
 ) -> None:
     radius = chord_corrected_radius(length, angle, node_count)
     protection_radius = wall_radius - safe_distance
@@ -85,7 +85,7 @@ def write_obj(
         f"# wall_radius={wall_radius:.17g}m safe_distance={safe_distance:.17g}m protection_radius={protection_radius:.17g}m",
         f"# cross_section_sides={sides} axial_segments={axial_segments} centerline_nodes={node_count}",
     ]
-    if plane != "xy":
+    if plane == "xz":
         lines.append(f"# centerline_plane={plane}")
     lines.extend("v " + " ".join(f"{value:.17g}" for value in point) for point in vertices)
 
@@ -121,7 +121,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--safe-distance", type=float, default=0.01)
     parser.add_argument("--axial-segments", type=int, default=256)
     parser.add_argument("--sides", type=int, default=64)
-    parser.add_argument("--plane", choices=("xy", "xz"), default="xy")
+    parser.add_argument("--plane", choices=("xy", "xz"), default="xz")
     args = parser.parse_args()
     if args.length <= 0.0 or not 0.0 < args.angle_deg < 360.0:
         parser.error("length must be positive and angle-deg must lie in (0, 360)")

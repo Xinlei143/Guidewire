@@ -14,7 +14,7 @@ import rod_soft_contact_PI_dynamic_quasi_static_3d_v4 as v4
 
 ROOT = Path(__file__).resolve().parents[1]
 OBJ = ROOT / "tube_obj" / "straight_tube_L1p5m_boundaryR50mm_shellR60mm_32sides_axial2.obj"
-CURVED_OBJ = ROOT / "tube_obj" / "curved_tube_L1p5m_boundaryR50mm_shellR60mm_32sides_axial48_archA20mm.obj"
+CURVED_OBJ = ROOT / "tube_obj" / "arc90_L1p5m_xz_wallR60mm_protectionR50mm_64sides_axial256.obj"
 
 
 def _write_indexed_obj(path, vertices, faces, flip_faces=()):
@@ -578,10 +578,10 @@ def test_mesh_visualization_proxy_is_low_resolution_and_follows_imported_curve()
     assert surface[1].shape == surface[0].shape
     assert surface[2].shape == surface[0].shape
     assert np.isfinite(np.stack(surface)).all()
-    # The proxy must retain the arch rather than silently becoming a straight
-    # analytic cylinder; its ring centres vary by more than 10 mm in y.
-    centerline_y = np.mean(surface[1], axis=0)
-    assert float(centerline_y.max() - centerline_y.min()) > 0.01
+    # The proxy must retain the xz-plane arc rather than silently becoming a
+    # straight analytic cylinder; its ring centres vary by more than 10 mm in z.
+    centerline_z = np.mean(surface[2], axis=0)
+    assert float(centerline_z.max() - centerline_z.min()) > 0.01
 
 
 def test_tube_visualization_surface_keeps_analytic_cylinder_fallback():

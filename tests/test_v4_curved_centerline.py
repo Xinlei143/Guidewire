@@ -12,8 +12,8 @@ import rod_soft_contact_PI_dynamic_quasi_static_3d_v4 as v4
 
 
 ROOT = Path(__file__).resolve().parents[1]
-OBJ = ROOT / "tube_obj" / "arc90_L1p5m_wallR60mm_protectionR50mm_64sides_axial256.obj"
-CENTERLINE = ROOT / "tube_obj" / "arc90_L1p5m_centerline_800.csv"
+OBJ = ROOT / "tube_obj" / "arc90_L1p5m_xz_wallR60mm_protectionR50mm_64sides_axial256.obj"
+CENTERLINE = ROOT / "tube_obj" / "arc90_L1p5m_xz_centerline_800.csv"
 GENERATOR = ROOT / "tools" / "generate_arc_vessel_3d.py"
 RADIUS = 0.9549298123336835
 
@@ -22,7 +22,8 @@ def test_centerline_matches_discrete_2d_arc_geometry():
     line = Centerline3D.from_csv(CENTERLINE)
     assert line.points.shape == (800, 3)
     np.testing.assert_allclose(line.points[0], (0.0, 0.0, 0.0), atol=1e-15)
-    np.testing.assert_allclose(line.points[-1], (RADIUS, RADIUS, 0.0), atol=2e-15)
+    np.testing.assert_allclose(line.points[:, 1], 0.0, atol=0.0)
+    np.testing.assert_allclose(line.points[-1], (RADIUS, 0.0, RADIUS), atol=2e-15)
     assert line.length == pytest.approx(1.5, abs=2e-14)
 
     sampled = line.sample_by_arclength(1.5, 300)
@@ -253,8 +254,8 @@ def test_curved_random_pulses_use_local_bishop_normal_plane(monkeypatch):
     np.testing.assert_allclose(np.linalg.norm(directions, axis=1), 1.0, atol=2e-12)
     assert np.any(np.abs(profile[nodes, 2]) > 1.0e-8)
     assert np.any(np.abs(profile[nodes, :2]) > 1.0e-8)
-    np.testing.assert_allclose(binormals[:, 2], 0.0, atol=2e-12)
-    np.testing.assert_allclose(np.abs(normals[:, 2]), 1.0, atol=2e-12)
+    np.testing.assert_allclose(normals[:, 1], 0.0, atol=2e-12)
+    np.testing.assert_allclose(np.abs(binormals[:, 1]), 1.0, atol=2e-12)
 
 
 def test_curved_geometry_validation_reports_positive_clearance(monkeypatch):

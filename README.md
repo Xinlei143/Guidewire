@@ -115,8 +115,8 @@ conda run --no-capture-output -n pendulum-rl python -u \
 仓库提供一对由同一确定性脚本生成的几何输入：
 
 ```text
-tube_obj/arc90_L1p5m_wallR60mm_protectionR50mm_64sides_axial256.obj
-tube_obj/arc90_L1p5m_centerline_800.csv
+tube_obj/arc90_L1p5m_xz_wallR60mm_protectionR50mm_64sides_axial256.obj
+tube_obj/arc90_L1p5m_xz_centerline_800.csv
 ```
 
 CSV 必须使用 `x,y,z` 表头，单位为 m，点序从入口到出口。中轴线继续严格采用
@@ -137,8 +137,8 @@ MPLBACKEND=Agg MPLCONFIGDIR=/tmp/softrobot-mplconfig \
 conda run --no-capture-output -n pendulum-rl python -u \
   rod_soft_contact_PI_dynamic_quasi_static_3d_v4.py \
   --backend cpp --device cpu --contact-type mesh \
-  --mesh-obj tube_obj/arc90_L1p5m_wallR60mm_protectionR50mm_64sides_axial256.obj \
-  --centerline-csv tube_obj/arc90_L1p5m_centerline_800.csv \
+  --mesh-obj tube_obj/arc90_L1p5m_xz_wallR60mm_protectionR50mm_64sides_axial256.obj \
+  --centerline-csv tube_obj/arc90_L1p5m_xz_centerline_800.csv \
   --num-nodes 300 --tube-radius 0.06 --safe-distance 0.01 \
   --Kp 3500 --Ki 100 --dt 0.005 \
   --tip-total-displacement 0.12 --num-load-steps 20 \
