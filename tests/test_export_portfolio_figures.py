@@ -107,6 +107,13 @@ def test_exporter_creates_traceable_fixed_size_webp_assets(tmp_path):
             assert image.size == (1600, 900)
             assert image.format == "WEBP"
 
+    with Image.open(outputs[0]) as image:
+        pixels = np.asarray(image.convert("RGB"), dtype=np.int16)
+    foreground = np.max(np.abs(pixels - np.asarray((251, 251, 250))), axis=2) > 12
+    rows, columns = np.where(foreground)
+    assert (columns.max() - columns.min() + 1) / 1600 >= 0.45
+    assert (rows.max() - rows.min() + 1) / 900 >= 0.55
+
     metadata = json.loads((output_dir / "figure-metadata.json").read_text(encoding="utf-8"))
     assert metadata["validation"]["analytic"]["completed_load_steps"] == 20
     assert metadata["validation"]["mesh"]["completed_load_steps"] == 20

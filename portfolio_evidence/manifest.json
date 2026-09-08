@@ -78,8 +78,8 @@
       "source_run": "analytic",
       "width": 1600,
       "height": 900,
-      "bytes": 6958,
-      "sha256": "0eaca8182d8cb11cc6f3dc1110d574d6cb04e7e58e07fd0acfdbe94dc873f5a8"
+      "bytes": 9708,
+      "sha256": "2bb05d1f49c55507ed6b352b2f8fc3f1b5e610f11966bdcf96e3ef1f912c9d65"
     },
     "contact-models.webp": {
       "source_runs": ["analytic", "mesh"],

@@ -175,10 +175,10 @@ def render_hero(run: dict[str, np.ndarray], centerline_csv: Path, output: Path) 
     ax.plot_surface(x, y, z, color="#b8d2df", alpha=0.20, linewidth=0, shade=False)
     add_rod(ax, run)
     style_axis(ax, np.concatenate((run["centerline_points"], run["positions"][-1]), axis=0))
+    figure.subplots_adjust(left=0, right=1, bottom=0, top=1)
     # A single 3-D axes otherwise occupies only a centered square inside a 16:9
     # canvas. Enlarge it so the curved guidewire remains legible at card width.
-    ax.set_position([0.08, -0.20, 0.84, 1.40])
-    figure.subplots_adjust(left=0, right=1, bottom=0, top=1)
+    ax.set_position([0.04, -0.28, 0.92, 1.56])
     save_webp(figure, output)
 
 
