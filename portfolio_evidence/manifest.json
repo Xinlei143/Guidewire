@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-09-08",
+  "source": {
+    "softrobot_commit": "61ab25ed8f3710230bb2aec7772df2265d91acca",
+    "website_baseline_commit": "c14f45f16dff1c569d0bd8c59985943cfe56b196"
+  },
+  "environment": {
+    "platform": "Linux-6.8.0-138-generic-x86_64-with-glibc2.35",
+    "conda_environment": "pendulum-rl",
+    "python": "3.10.20",
+    "numpy": "2.2.6",
+    "torch": "2.11.0+cu130",
+    "render_backend": "MPLBACKEND=Agg"
+  },
+  "commands": {
+    "analytic_baseline": "env MPLBACKEND=Agg MPLCONFIGDIR=/tmp/softrobot-mplconfig conda run --no-capture-output -n pendulum-rl python -u rod_soft_contact_PI_dynamic_quasi_static_3d_v4.py --backend cpp --device cpu --contact-type curved-tube --num-nodes 300 --tube-radius 0.06 --safe-distance 0.01 --Kp 3500 --Ki 100 --dt 0.005 --tip-total-displacement 0.12 --num-load-steps 20 --pulse-seed 7 --prebalance --skip-animation --no-show --output-prefix portfolio_evidence/runs/curved_analytic",
+    "mesh_baseline": "env MPLBACKEND=Agg MPLCONFIGDIR=/tmp/softrobot-mplconfig conda run --no-capture-output -n pendulum-rl python -u rod_soft_contact_PI_dynamic_quasi_static_3d_v4.py --backend cpp --device cpu --contact-type mesh --mesh-obj tube_obj/arc90_L1p5m_xz_wallR60mm_protectionR50mm_64sides_axial256.obj --centerline-csv tube_obj/arc90_L1p5m_xz_centerline_800.csv --num-nodes 300 --tube-radius 0.06 --safe-distance 0.01 --Kp 3500 --Ki 100 --dt 0.005 --tip-total-displacement 0.12 --num-load-steps 20 --pulse-seed 7 --prebalance --skip-animation --no-show --output-prefix portfolio_evidence/runs/curved_mesh",
+    "figure_export": "conda run --no-capture-output -n pendulum-rl python tools/export_portfolio_figures.py --analytic-npz portfolio_evidence/runs/curved_analytic.npz --mesh-npz portfolio_evidence/runs/curved_mesh.npz --mesh-obj tube_obj/arc90_L1p5m_xz_wallR60mm_protectionR50mm_64sides_axial256.obj --centerline-csv tube_obj/arc90_L1p5m_xz_centerline_800.csv --output-dir portfolio_evidence/figures --expected-load-steps 20",
+    "cpp_smoke": "env MPLBACKEND=Agg MPLCONFIGDIR=/tmp/softrobot-mplconfig conda run --no-capture-output -n pendulum-rl python -u cpp/build_der_core.py --nodes 8",
+    "v4_self_test": "env MPLBACKEND=Agg MPLCONFIGDIR=/tmp/softrobot-mplconfig conda run --no-capture-output -n pendulum-rl python -u rod_soft_contact_PI_dynamic_quasi_static_3d_v4.py --self-test",
+    "targeted_tests": "env PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 MPLBACKEND=Agg MPLCONFIGDIR=/tmp/softrobot-mplconfig conda run --no-capture-output -n pendulum-rl python -m pytest -q tests/test_v4_mesh_contact.py tests/test_v4_cpp_backend.py tests/test_v3_phase1.py tests/test_v4_curved_centerline.py tests/test_v4_analytic_bending.py tests/test_export_portfolio_figures.py",
+    "full_tests": "env PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 MPLBACKEND=Agg MPLCONFIGDIR=/tmp/softrobot-mplconfig conda run --no-capture-output -n pendulum-rl python -m pytest -q"
+  },
+  "simulation_parameters": {
+    "num_nodes": 300,
+    "num_load_steps": 20,
+    "tube_radius_m": 0.06,
+    "safe_distance_m": 0.01,
+    "protection_radius_m": 0.05,
+    "Kp": 3500.0,
+    "Ki": 100.0,
+    "dt_s": 0.005,
+    "tip_total_displacement_m": 0.12,
+    "pulse_seed": 7,
+    "backend": "cpp",
+    "device": "cpu",
+    "prebalance": true,
+    "centerline": {
+      "shape": "90-degree circular arc in the xz plane",
+      "length_m": 1.5,
+      "samples": 800
+    }
+  },
+  "publication_gate": {
+    "expected_load_steps": 20,
+    "max_final_speed_m_per_s": 0.001,
+    "max_final_residual_n": 0.000001,
+    "max_final_contact_error_m": 0.0005,
+    "require_finite_arrays": true
+  },
+  "runs": {
+    "analytic": {
+      "contact_type": "curved-tube",
+      "completed_load_steps": 20,
+      "final_max_free_node_speed_m_per_s": 0.0008818996997846711,
+      "final_newton_residual_n": 3.649712800197958e-08,
+      "final_max_protection_error_m": 5.550408128441979e-05,
+      "npz_sha256": "6024715c6284b40570ef4cab57be7f04e3d5e9f1f1b5a39a37f28f0540638e1e",
+      "log_sha256": "e543ee03455802358ccc3cfb146954ed8e3f3ed5246606a18d11f352996827a0",
+      "gate_passed": true
+    },
+    "mesh": {
+      "contact_type": "mesh",
+      "completed_load_steps": 20,
+      "final_max_free_node_speed_m_per_s": 0.0008873117373293452,
+      "final_newton_residual_n": 3.82068834670853e-08,
+      "final_max_protection_error_m": 8.125904951113527e-05,
+      "npz_sha256": "d819c740c1d13af2b908a32a00115f0c7a1fab1bdfbcfec789a9345f009c83ed",
+      "log_sha256": "e4cce4ed19d51a7aca04c251c2b5d109b96c1cc4f01b57c7321f3ce01ca1f35b",
+      "mesh_obj_sha256": "3f4e29c74c7d240cfc36231a63021a8f619cef22ee3fd4bca046679caac6266c",
+      "centerline_csv_sha256": "33856a6b632739e1b5b6a7872072e04b4778f893b71dbccfa224832c5d01ed61",
+      "gate_passed": true
+    }
+  },
+  "published_figures": {
+    "hero-curved-guidewire.webp": {
+      "source_run": "analytic",
+      "width": 1600,
+      "height": 900,
+      "bytes": 6958,
+      "sha256": "0eaca8182d8cb11cc6f3dc1110d574d6cb04e7e58e07fd0acfdbe94dc873f5a8"
+    },
+    "contact-models.webp": {
+      "source_runs": ["analytic", "mesh"],
+      "width": 1600,
+      "height": 900,
+      "bytes": 28180,
+      "sha256": "8f1eceb2d587e7dcbcc452d9e0c6b63b0cba4a857633ffecbe6d35b1c62d5369"
+    }
+  },
+  "tests": {
+    "cpp_extension_smoke": "passed",
+    "v4_self_test": "passed",
+    "targeted_suite": "82 passed in 17.44s (79 existing tests plus 3 exporter tests)",
+    "full_suite": "collection stopped at tests/test_local_dense_jacobian.py because it imports the removed historical module rod_soft_contact_PI_dynamic_quasi_static"
+  },
+  "withheld_results": {
+    "backend_performance_figure": "not published",
+    "reason": "The default 20-Newton-iteration bent and contact benchmark cases did not pass the convergence gate; their timings are not public evidence."
+  },
+  "repository_policy": "Only this manifest is tracked. NPZ states, logs, and raw/generated evidence figures remain ignored."
+}

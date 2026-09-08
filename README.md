@@ -155,7 +155,7 @@ conda run -n pendulum-rl python tools/generate_arc_vessel_3d.py
 
 `--contact-type curved-tube` 直接使用与 2-D 弯曲血管脚本相同的默认参数，并将该圆弧嵌入全局 xz 平面（y=0）：
 1.5 m 离散弦长、90° 圆弧、800 点弦长修正半径
-`0.9549298123336835 m`、实体管腔半径 50 mm、10 mm 安全层和 40 mm
+`0.9549298123336835 m`、实体管腔半径 60 mm、10 mm 安全层和 50 mm
 接触保护半径。接触距离是节点到圆弧中轴线的三维解析距离，法向和完整 3×3
 Jacobian 均连续，不读取 `--mesh-obj`，也不受三角面数量或法向跳变影响。
 
@@ -170,7 +170,7 @@ conda run --no-capture-output -n pendulum-rl python -u \
 ```
 
 若显式传入 `--tube-radius` 或 `--safe-distance`，可覆盖上述截面默认值；不传时
-`curved-tube` 使用 2-D 的 50/10 mm，而原有直管 `tube` 仍使用 v4 的 60/10 mm。
+`curved-tube` 与原有直管 `tube` 均使用 60/10 mm 的默认截面参数。
 
 省略 `--backend` 和 `--contact-type` 时，默认分别为 `cpp` 和 `tube`。C++ 后端
 不能配合 `--device cuda`；需要 GPU 时使用 Python 后端。

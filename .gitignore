@@ -36,3 +36,7 @@ rodsim_2d_vessel_boundary_PI
 Stretching_bending
 soft_robot_chain_bending_stretching_torsion.py
 2d_npz
+
+# Reproducible portfolio evidence: keep only the lightweight provenance manifest.
+portfolio_evidence/*
+!portfolio_evidence/manifest.json
