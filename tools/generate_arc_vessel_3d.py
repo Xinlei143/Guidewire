@@ -19,9 +19,12 @@ def chord_corrected_radius(length: float, angle: float, node_count: int) -> floa
     return length / (2.0 * (node_count - 1) * math.sin(angle / (2.0 * (node_count - 1))))
 
 
-def arc_centers(radius: float, angle: float, count: int) -> np.ndarray:
+def arc_centers(radius: float, angle: float, count: int, plane: str = "xy") -> np.ndarray:
     theta = np.linspace(0.0, angle, count)
-    return np.column_stack((radius * np.sin(theta), radius * (1.0 - np.cos(theta)), np.zeros(count)))
+    bend = radius * (1.0 - np.cos(theta))
+    if plane == "xz":
+        return np.column_stack((radius * np.sin(theta), np.zeros(count), bend))
+    return np.column_stack((radius * np.sin(theta), bend, np.zeros(count)))
 
 
 def write_centerline(path: Path, centers: np.ndarray) -> None:
@@ -31,15 +34,22 @@ def write_centerline(path: Path, centers: np.ndarray) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="ascii")
 
 
-def rings(radius: float, angle: float, count: int, cross_radius: float, sides: int) -> np.ndarray:
+def rings(
+    radius: float, angle: float, count: int, cross_radius: float, sides: int,
+    plane: str = "xy",
+) -> np.ndarray:
     theta = np.linspace(0.0, angle, count)
-    centers = arc_centers(radius, angle, count)
-    outward = np.column_stack((np.sin(theta), -np.cos(theta), np.zeros(count)))
-    vertical = np.array((0.0, 0.0, 1.0))
+    centers = arc_centers(radius, angle, count, plane)
+    if plane == "xz":
+        outward = np.column_stack((np.sin(theta), np.zeros(count), -np.cos(theta)))
+        binormal = np.array((0.0, 1.0, 0.0))
+    else:
+        outward = np.column_stack((np.sin(theta), -np.cos(theta), np.zeros(count)))
+        binormal = np.array((0.0, 0.0, 1.0))
     phi = np.linspace(0.0, 2.0 * math.pi, sides, endpoint=False)
     return centers[:, None, :] + cross_radius * (
         np.cos(phi)[None, :, None] * outward[:, None, :]
-        + np.sin(phi)[None, :, None] * vertical[None, None, :]
+        + np.sin(phi)[None, :, None] * binormal[None, None, :]
     )
 
 
@@ -60,12 +70,13 @@ def surface_faces(ring_count: int, sides: int, offset: int, *, reverse: bool) ->
 def write_obj(
     path: Path, *, length: float, angle: float, node_count: int,
     wall_radius: float, safe_distance: float, axial_segments: int, sides: int,
+    plane: str = "xy",
 ) -> None:
     radius = chord_corrected_radius(length, angle, node_count)
     protection_radius = wall_radius - safe_distance
     ring_count = axial_segments + 1
-    protection = rings(radius, angle, ring_count, protection_radius, sides)
-    wall = rings(radius, angle, ring_count, wall_radius, sides)
+    protection = rings(radius, angle, ring_count, protection_radius, sides, plane)
+    wall = rings(radius, angle, ring_count, wall_radius, sides, plane)
     vertices = np.concatenate((protection.reshape(-1, 3), wall.reshape(-1, 3)), axis=0)
     wall_offset = protection.size // 3
     lines = [
@@ -74,6 +85,8 @@ def write_obj(
         f"# wall_radius={wall_radius:.17g}m safe_distance={safe_distance:.17g}m protection_radius={protection_radius:.17g}m",
         f"# cross_section_sides={sides} axial_segments={axial_segments} centerline_nodes={node_count}",
     ]
+    if plane != "xy":
+        lines.append(f"# centerline_plane={plane}")
     lines.extend("v " + " ".join(f"{value:.17g}" for value in point) for point in vertices)
 
     lines.append(f"g protection_boundary_r_{protection_radius:.6f}m")
@@ -108,6 +121,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--safe-distance", type=float, default=0.01)
     parser.add_argument("--axial-segments", type=int, default=256)
     parser.add_argument("--sides", type=int, default=64)
+    parser.add_argument("--plane", choices=("xy", "xz"), default="xy")
     args = parser.parse_args()
     if args.length <= 0.0 or not 0.0 < args.angle_deg < 360.0:
         parser.error("length must be positive and angle-deg must lie in (0, 360)")
@@ -122,12 +136,15 @@ def main() -> None:
     args = parse_args()
     angle = math.radians(args.angle_deg)
     radius = chord_corrected_radius(args.length, angle, args.centerline_nodes)
-    write_centerline(args.output_centerline, arc_centers(radius, angle, args.centerline_nodes))
+    write_centerline(
+        args.output_centerline,
+        arc_centers(radius, angle, args.centerline_nodes, args.plane),
+    )
     write_obj(
         args.output_obj, length=args.length, angle=angle,
         node_count=args.centerline_nodes, wall_radius=args.wall_radius,
         safe_distance=args.safe_distance, axial_segments=args.axial_segments,
-        sides=args.sides,
+        sides=args.sides, plane=args.plane,
     )
 
 

@@ -67,6 +67,13 @@ class DERCore {
       double ki_active) const;
 
  private:
+  py::dict contact_kernel_impl(const py::array& positions,
+                               const py::array& integrals,
+                               const py::array& previous_errors, double dt,
+                               double ki_active,
+                               const std::vector<int>* fixed_faces,
+                               const std::vector<Vec3>* fixed_normals,
+                               const std::vector<Vec3>* fixed_references) const;
   std::vector<double> rest_lengths_;
   std::vector<double> masses_;
   double ea_;
@@ -86,6 +93,7 @@ class DERCore {
   double arc_radius_ = 0.0;
   std::vector<Vec3> mesh_triangles_;
   std::vector<Vec3> mesh_normals_;
+  std::vector<Vec3> mesh_vertex_normals_;
   std::vector<std::int64_t> mesh_triangle_ids_;
   MeshBVH mesh_bvh_;
 };

@@ -76,6 +76,37 @@ def test_committed_geometry_is_deterministically_generated(tmp_path):
     assert generated_csv.read_bytes() == CENTERLINE.read_bytes()
 
 
+def test_generator_embeds_2d_arc_in_xz_plane_with_straight_tube_cross_section(tmp_path):
+    generated_obj = tmp_path / "xz.obj"
+    generated_csv = tmp_path / "xz.csv"
+    subprocess.run(
+        [sys.executable, str(GENERATOR), "--plane", "xz",
+         "--output-obj", str(generated_obj),
+         "--output-centerline", str(generated_csv)],
+        cwd=ROOT, check=True,
+    )
+
+    line = Centerline3D.from_csv(generated_csv)
+    np.testing.assert_allclose(line.points[:, 1], 0.0, atol=0.0)
+    np.testing.assert_allclose(line.points[0], (0.0, 0.0, 0.0), atol=1e-15)
+    np.testing.assert_allclose(line.points[-1], (RADIUS, 0.0, RADIUS), atol=2e-15)
+    assert line.length == pytest.approx(1.5, abs=2e-14)
+
+    vertices, faces, groups = mesh._parse_obj(generated_obj)
+    assert vertices.shape == (32896, 3)
+    assert faces.shape == (65792, 3)
+    protection_ids = mesh._select_group(groups, "protection")
+    assert protection_ids.shape == (32768,)
+    ring_vertices = (256 + 1) * 64
+    np.testing.assert_allclose(
+        np.linalg.norm(vertices[:64] - line.points[0], axis=1), 0.05, atol=2e-12,
+    )
+    np.testing.assert_allclose(
+        np.linalg.norm(vertices[ring_vertices:ring_vertices + 64] - line.points[0], axis=1),
+        0.06, atol=2e-12,
+    )
+
+
 def test_arc_obj_has_expected_topology_and_clearance():
     vertices, faces, groups = mesh._parse_obj(OBJ)
     assert vertices.shape == (32896, 3)
@@ -122,7 +153,7 @@ def test_curved_tube_parser_uses_2d_vessel_defaults_without_mesh(monkeypatch):
     args = _smooth_curved_args(monkeypatch)
     assert args.contact_type == "curved-tube"
     assert args.centerline_csv is None
-    assert args.tube_radius == pytest.approx(0.05)
+    assert args.tube_radius == pytest.approx(0.06)
     assert args.safe_distance == pytest.approx(0.01)
     assert args.arc_angle_deg == pytest.approx(90.0)
     assert args.arc_radius == pytest.approx(RADIUS, abs=2e-15)
@@ -152,7 +183,7 @@ def test_curved_tube_contact_is_smooth_and_matches_2d_plane(monkeypatch):
         lambda p: v4._curved_tube_contact_single(p, old_i, previous, args)[0]
     )(point)
     assert torch.dot(force, point - centerline) < 0.0
-    assert float(distance) == pytest.approx(0.05 - np.hypot(0.0402, 0.001), abs=2e-12)
+    assert float(distance) == pytest.approx(0.06 - np.hypot(0.0402, 0.001), abs=2e-12)
     assert torch.isfinite(jacobian).all()
     assert torch.max(torch.abs(jacobian - jacobian.T)) < 2.0e-7
 
@@ -177,7 +208,7 @@ def test_curved_tube_visualization_surface_has_2d_default_radius(monkeypatch):
         np.zeros_like(theta),
         args.arc_radius * (1.0 - np.cos(theta)),
     ))
-    np.testing.assert_allclose(np.linalg.norm(points - centerline[:, None], axis=2), 0.05, atol=2e-12)
+    np.testing.assert_allclose(np.linalg.norm(points - centerline[:, None], axis=2), 0.06, atol=2e-12)
 
 
 def test_parser_enables_opt_in_curved_mode_and_rejects_analytic_contact(monkeypatch):

@@ -36,7 +36,7 @@ BACKEND_DEFAULT = "cpp"
 CONTACT_TYPE_DEFAULT = "tube"
 MESH_OBJ_DEFAULT = ROOT / "tube_obj" / "straight_tube_L1p5m_boundaryR50mm_shellR60mm_32sides_axial2.obj"
 CENTERLINE_CSV_DEFAULT = None
-CURVED_TUBE_RADIUS = 50.0e-3
+CURVED_TUBE_RADIUS = 60.0e-3
 CURVED_TUBE_SAFE_DISTANCE = 10.0e-3
 CURVED_TUBE_ARC_ANGLE_DEG = 90.0
 CURVED_TUBE_CENTERLINE_NODES = 800
@@ -795,16 +795,43 @@ def compute_protection_error(positions: torch.Tensor, radius: float, safe_distan
 
 
 def compute_contact_error(positions: torch.Tensor, args: argparse.Namespace) -> torch.Tensor:
+    started = time.perf_counter()
+    try:
+        if getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) == "mesh":
+            details = _mesh_details(positions, args)
+            return torch.clamp(-details.clearance, min=0.0)
+        if getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) == "curved-tube":
+            zero = torch.zeros(len(positions), dtype=positions.dtype, device=positions.device)
+            values = torch.func.vmap(_curved_tube_contact_single, in_dims=(0, 0, 0, None))(
+                positions, zero, zero, args,
+            )
+            return torch.clamp(args.safe_distance - values[5], min=0.0)
+        return compute_protection_error(positions, args.tube_radius, args.safe_distance)
+    finally:
+        profile = getattr(args, "performance_profile", None)
+        if profile is not None:
+            profile["python_contact_error_s"] = profile.get("python_contact_error_s", 0.0) + time.perf_counter() - started
+            profile["python_contact_error_count"] = profile.get("python_contact_error_count", 0) + 1
+
+
+def contact_diagnostics(
+    positions: torch.Tensor,
+    args: argparse.Namespace,
+    *,
+    accepted_clearance: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return stored clearance and protection error for an accepted state."""
     if getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) == "mesh":
-        details = _mesh_details(positions, args)
-        return torch.clamp(-details.clearance, min=0.0)
-    if getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) == "curved-tube":
-        zero = torch.zeros(len(positions), dtype=positions.dtype, device=positions.device)
-        values = torch.func.vmap(_curved_tube_contact_single, in_dims=(0, 0, 0, None))(
-            positions, zero, zero, args,
+        clearance = (
+            _mesh_details(positions, args).clearance
+            if accepted_clearance is None
+            else accepted_clearance
         )
-        return torch.clamp(args.safe_distance - values[5], min=0.0)
-    return compute_protection_error(positions, args.tube_radius, args.safe_distance)
+        return clearance, torch.clamp(-clearance, min=0.0)
+    clearance = torch.full(
+        (len(positions),), math.nan, dtype=positions.dtype, device=positions.device,
+    )
+    return clearance, compute_contact_error(positions, args)
 
 
 @dataclass(frozen=True)
@@ -1156,13 +1183,15 @@ def _implicit_euler_step_python(
     new_velocities[:2] = 0.0
     if tip_constrained:
         new_velocities[-1] = (prescribed[-1] - positions[-1]) / args.dt_active
-    if getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) == "mesh":
-        args._frozen_mesh_topology = None
     contact_started = time.perf_counter()
-    with torch.no_grad():
-        force, new_integrals, active, weights, errors, distances = contact_quantities(
-            new_positions, integrals, previous_errors, args
-        )
+    try:
+        with torch.no_grad():
+            force, new_integrals, active, weights, errors, distances = contact_quantities(
+                new_positions, integrals, previous_errors, args
+            )
+    finally:
+        if getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) == "mesh":
+            args._frozen_mesh_topology = None
     add_time("contact_s", contact_started)
     return (
         new_positions, new_velocities, new_integrals, force, active, weights, errors, distances,
@@ -1201,13 +1230,35 @@ def _get_core(args: argparse.Namespace, rest_lengths: torch.Tensor,
             geometry = _ensure_mesh_geometry(args, rest_lengths.device)
             core.configure_mesh(
                 np.ascontiguousarray(geometry.triangles.detach().cpu().numpy(), dtype=np.float64),
-                np.ascontiguousarray(geometry.normals.detach().cpu().numpy(), dtype=np.float64),
+                np.ascontiguousarray(geometry.triangle_vertex_normals.detach().cpu().numpy(), dtype=np.float64),
                 np.ascontiguousarray(geometry.triangle_obj_ids.detach().cpu().numpy(), dtype=np.int64),
             )
         elif getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) == "curved-tube":
             core.configure_curved_tube(args.arc_radius)
         args._cpp_core = core
     return core
+
+
+def initial_accepted_clearance(
+    positions: torch.Tensor,
+    rest_lengths: torch.Tensor,
+    masses: torch.Tensor,
+    args: argparse.Namespace,
+) -> torch.Tensor | None:
+    """Query the configured C++ BVH for the pre-step mesh snapshot."""
+    if (
+        getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) != "mesh"
+        or getattr(args, "backend", BACKEND_DEFAULT) != "cpp"
+    ):
+        return None
+    core = _get_core(args, rest_lengths, masses)
+    zeros = np.zeros(len(positions), dtype=np.float64)
+    result = core.contact_kernel(
+        _as_numpy(positions, "positions"), zeros, zeros, args.dt, args.ki_active,
+    )
+    return torch.as_tensor(
+        result["distances"], dtype=positions.dtype, device=positions.device,
+    )
 
 
 def _cpp_implicit_euler_step(
@@ -1369,6 +1420,8 @@ def summarize_contact_segments(active: np.ndarray, forces: np.ndarray, positions
 
 
 def run_simulation(args: argparse.Namespace) -> dict[str, np.ndarray]:
+    end_to_end_started = time.perf_counter()
+    initialization_started = time.perf_counter()
     positions, velocities, rest_lengths, masses, integrals = initialize_rod(
         args.total_length, args.num_nodes, args.diameter, args.density,
         centerline=getattr(args, "centerline", None),
@@ -1379,6 +1432,8 @@ def run_simulation(args: argparse.Namespace) -> dict[str, np.ndarray]:
     rest_lengths = torch.as_tensor(rest_lengths, dtype=DTYPE, device=device)
     masses = torch.as_tensor(masses, dtype=DTYPE, device=device)
     integrals = torch.as_tensor(integrals, dtype=DTYPE, device=device)
+    initialization_elapsed = time.perf_counter() - initialization_started
+    mesh_setup_started = time.perf_counter()
     if getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) == "mesh":
         geometry = _ensure_mesh_geometry(args, device)
         if getattr(args, "centerline", None) is not None:
@@ -1394,6 +1449,7 @@ def run_simulation(args: argparse.Namespace) -> dict[str, np.ndarray]:
             f"total={args.mesh_preprocess_stats['mesh_preprocess_total_ms']:.3f} ms",
             flush=True,
         )
+    mesh_setup_elapsed = time.perf_counter() - mesh_setup_started
     initial_positions = positions.detach().clone()
     args.dt_active = args.dt
     args.ki_active = args.Ki
@@ -1420,6 +1476,8 @@ def run_simulation(args: argparse.Namespace) -> dict[str, np.ndarray]:
     # per-dt 计时：每个隐式 Euler 步(=一次 dt 推进)都记录墙钟时间、阶段、子步长与
     # 内部时间去向，用于诊断真实世界中的每步计算耗时。
     args.performance_profile = getattr(args, "performance_profile", None) or {}
+    args.performance_profile["initialization_s"] = initialization_elapsed
+    args.performance_profile["mesh_setup_and_validation_s"] = mesh_setup_elapsed
     args.dt_timings: list[dict] = []
     args._dt_phase = "initial"
     args._current_dt_record: dict | None = None
@@ -1449,7 +1507,12 @@ def run_simulation(args: argparse.Namespace) -> dict[str, np.ndarray]:
         weights: torch.Tensor,
         info: NewtonInfo,
         tip_constrained: bool,
+        accepted_clearance: torch.Tensor | None = None,
     ) -> None:
+        record_started = time.perf_counter()
+        centerline_elapsed = 0.0
+        mesh_elapsed = 0.0
+        energy_elapsed = 0.0
         p_np = tensor_to_numpy(positions).copy()
         history["time"].append(time_value)
         history["phase"].append(args._dt_phase)
@@ -1469,16 +1532,17 @@ def run_simulation(args: argparse.Namespace) -> dict[str, np.ndarray]:
             history["centerline_s"].append(np.full(args.num_nodes, np.nan))
             history["distance_to_centerline"].append(np.full(args.num_nodes, np.nan))
         else:
+            centerline_started = time.perf_counter()
             centerline_s, centerline_distance = centerline.project(p_np)
+            centerline_elapsed = time.perf_counter() - centerline_started
             history["centerline_s"].append(centerline_s)
             history["distance_to_centerline"].append(centerline_distance)
-        if getattr(args, "contact_type", CONTACT_TYPE_DEFAULT) == "mesh":
-            details = _mesh_details(positions, args)
-            mesh_clearance = tensor_to_numpy(details.clearance).copy()
-            protection = torch.clamp(-details.clearance, min=0.0)
-        else:
-            mesh_clearance = np.full(args.num_nodes, np.nan)
-            protection = compute_contact_error(positions, args)
+        mesh_started = time.perf_counter()
+        clearance, protection = contact_diagnostics(
+            positions, args, accepted_clearance=accepted_clearance,
+        )
+        mesh_elapsed = time.perf_counter() - mesh_started
+        mesh_clearance = tensor_to_numpy(clearance).copy()
         history["mesh_clearance"].append(mesh_clearance)
         history["max_protection_error"].append(float(torch.max(protection)))
         history["max_pi_force"].append(float(torch.linalg.vector_norm(force, dim=1).max()))
@@ -1486,13 +1550,22 @@ def run_simulation(args: argparse.Namespace) -> dict[str, np.ndarray]:
         history["newton_residual"].append(info.residual_norm)
         history["newton_converged"].append(info.converged)
         history["tip_position_constraint_active"].append(tip_constrained)
+        energy_started = time.perf_counter()
         stretch_energy, bend_energy, elastic_total = elastic_energy(positions, rest_lengths, args.EA, args.EI)
+        energy_elapsed = time.perf_counter() - energy_started
         history["elastic_stretch_energy_j"].append(float(stretch_energy))
         history["elastic_bend_energy_j"].append(float(bend_energy))
         history["elastic_total_energy_j"].append(float(elastic_total))
         extra_history_hook = getattr(args, "extra_history_record_hook", None)
         if extra_history_hook is not None:
             extra_history_hook(history, positions)
+        record_elapsed = time.perf_counter() - record_started
+        profile = args.performance_profile
+        profile["history_record_s"] = profile.get("history_record_s", 0.0) + record_elapsed
+        profile["history_record_count"] = profile.get("history_record_count", 0) + 1
+        profile["history_centerline_project_s"] = profile.get("history_centerline_project_s", 0.0) + centerline_elapsed
+        profile["history_mesh_details_s"] = profile.get("history_mesh_details_s", 0.0) + mesh_elapsed
+        profile["history_elastic_energy_s"] = profile.get("history_elastic_energy_s", 0.0) + energy_elapsed
 
     def advance(
         state: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
@@ -1614,7 +1687,13 @@ def run_simulation(args: argparse.Namespace) -> dict[str, np.ndarray]:
                 flush=True,
             )
 
-    record(0, 0.0, last_force, last_active, torch.zeros_like(integrals), last_info, False)
+    initial_clearance = initial_accepted_clearance(
+        positions, rest_lengths, masses, args,
+    )
+    record(
+        0, 0.0, last_force, last_active, torch.zeros_like(integrals), last_info, False,
+        accepted_clearance=initial_clearance,
+    )
     print("=" * 76)
     print("3-D DER + implicit Euler/Newton + node-wise PI soft contact (quasi-static displacement control)")
     print("=" * 76)
@@ -1686,7 +1765,10 @@ def run_simulation(args: argparse.Namespace) -> dict[str, np.ndarray]:
                 _p, _v, _i, last_force, last_active, weights, _errors, _distances,
                 last_info, _mask,
             ) = prebalance_result
-            record(-1, 0.0, last_force, last_active, weights, last_info, True)
+            record(
+                -1, 0.0, last_force, last_active, weights, last_info, True,
+                accepted_clearance=_distances,
+            )
         prebalanced_positions = tensor_to_numpy(positions).copy()
         print(f"[PREBALANCE COMPLETE] steps={prebalance_steps}", flush=True)
 
@@ -1711,7 +1793,10 @@ def run_simulation(args: argparse.Namespace) -> dict[str, np.ndarray]:
             abort_reason = f"Newton failure during initial pulse: residual={last_info.residual_norm:.3e}"
             print(f"EARLY ABORT: {abort_reason}")
             break
-        record(0, 0.0, last_force, last_active, weights, last_info, pulse_tip_constrained)
+        record(
+            0, 0.0, last_force, last_active, weights, last_info,
+            pulse_tip_constrained, accepted_clearance=_distances,
+        )
 
     for load_step in range(1, args.num_load_steps + 1):
         if abort_reason:
@@ -1763,7 +1848,9 @@ def run_simulation(args: argparse.Namespace) -> dict[str, np.ndarray]:
                 time_value += args.dt
                 current_max_speed = max_free_speed(velocities, prescribed_mask)
                 max_speed_seen = max(max_speed_seen, current_max_speed)
-                ramp_protection = compute_contact_error(positions, args)
+                _clearance, ramp_protection = contact_diagnostics(
+                    positions, args, accepted_clearance=_distances,
+                )
                 max_contact_error_seen = max(max_contact_error_seen, float(torch.max(ramp_protection)))
                 if ramp % DIAGNOSTIC_INTERVAL == 0 or ramp == args.tip_ramp_steps:
                     print(
@@ -1774,7 +1861,10 @@ def run_simulation(args: argparse.Namespace) -> dict[str, np.ndarray]:
                         f"contacts={int(torch.count_nonzero(last_active))}", flush=True,
                     )
                 if ramp % args.history_save_interval == 0 or ramp == args.tip_ramp_steps:
-                    record(load_step, displacement, last_force, last_active, weights, last_info, True)
+                    record(
+                        load_step, displacement, last_force, last_active, weights, last_info, True,
+                        accepted_clearance=_distances,
+                    )
         else:
             minimum_increment = macro_increment / args.tip_ramp_steps
             adaptive_increment = macro_increment / 2.0
@@ -1875,7 +1965,9 @@ def run_simulation(args: argparse.Namespace) -> dict[str, np.ndarray]:
                 adaptive_increment_sum += proposed_increment
                 time_value += args.dt * (1 + micro_steps)
                 max_speed_seen = max(max_speed_seen, current_max_speed)
-                ramp_protection = compute_contact_error(positions, args)
+                _clearance, ramp_protection = contact_diagnostics(
+                    positions, args, accepted_clearance=_distances,
+                )
                 max_contact_error_seen = max(max_contact_error_seen, float(torch.max(ramp_protection)))
                 print(
                     f"[ADAPT {load_step:02d}/{args.num_load_steps:02d} | {internal_step:3d}] "
@@ -1885,7 +1977,10 @@ def run_simulation(args: argparse.Namespace) -> dict[str, np.ndarray]:
                     f"contacts={int(torch.count_nonzero(last_active))}", flush=True,
                 )
                 if internal_step % args.history_save_interval == 0 or displacement >= target - 1e-15:
-                    record(load_step, displacement, last_force, last_active, weights, last_info, True)
+                    record(
+                        load_step, displacement, last_force, last_active, weights, last_info, True,
+                        accepted_clearance=_distances,
+                    )
 
                 easy_step = (
                     ramp_info.iterations <= 5 and ramp_info.line_search_failures == 0
@@ -1941,7 +2036,9 @@ def run_simulation(args: argparse.Namespace) -> dict[str, np.ndarray]:
                     f"{subdivisions} local substeps, Ki_eff={effective_ki:g}",
                     flush=True,
                 )
-            protection = compute_contact_error(positions, args)
+            _clearance, protection = contact_diagnostics(
+                positions, args, accepted_clearance=_distances,
+            )
             max_speed = max_free_speed(velocities, prescribed_mask)
             max_contact_error = float(torch.max(protection))
             max_pi_force = float(torch.linalg.vector_norm(last_force, dim=1).max())
@@ -1955,7 +2052,10 @@ def run_simulation(args: argparse.Namespace) -> dict[str, np.ndarray]:
             )
             stable = stable + 1 if equilibrium else 0
             if relaxation % args.history_save_interval == 0 or stable >= args.settle_confirm_steps:
-                record(load_step, target, last_force, last_active, weights, last_info, True)
+                record(
+                    load_step, target, last_force, last_active, weights, last_info, True,
+                    accepted_clearance=_distances,
+                )
             if relaxation % DIAGNOSTIC_INTERVAL == 0 or stable >= args.settle_confirm_steps:
                 contact_count = int(torch.count_nonzero(last_active))
                 contact_summary = f"contact={max_contact_error * 1e3:.4f} mm/{contact_count} nodes"
@@ -1991,11 +2091,15 @@ def run_simulation(args: argparse.Namespace) -> dict[str, np.ndarray]:
             print(f"EARLY ABORT: {abort_reason}")
             break
 
+    simulation_loop_elapsed = time.perf_counter() - start
+    post_loop_started = time.perf_counter()
     history_np = {key: np.asarray(value) for key, value in history.items()}
     final_positions = tensor_to_numpy(positions)
     final_forces = tensor_to_numpy(last_force)
     segments = summarize_contact_segments(tensor_to_numpy(last_active), final_forces, final_positions)
     stretch, bend, total = elastic_energy(positions, rest_lengths, args.EA, args.EI)
+    args.performance_profile["simulation_loop_total_s"] = simulation_loop_elapsed
+    args.performance_profile["post_loop_summary_s"] = time.perf_counter() - post_loop_started
     elapsed = time.perf_counter() - start
     print(
         f"completed_load_steps={completed_steps}/{args.num_load_steps}, "
@@ -2191,18 +2295,45 @@ def run_simulation(args: argparse.Namespace) -> dict[str, np.ndarray]:
         f"FINAL ENERGY ({state_label}, J): elastic_stretching={float(stretch):.8e} | "
         f"bending={float(bend):.8e} | total={float(total):.8e}"
     )
+    npz_started = time.perf_counter()
     npz_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(npz_path, **history_np)
+    npz_elapsed = time.perf_counter() - npz_started
     # 无论是否弹出窗口，都生成报告用 PNG；--no-show 时使用无界面后端保存。
     if not args.show:
         import matplotlib
         matplotlib.use("Agg")
+    figure_create_started = time.perf_counter()
     final_figure = create_final_result_figure(history_np, args)
+    figure_create_elapsed = time.perf_counter() - figure_create_started
+    figure_save_started = time.perf_counter()
     picture_path.parent.mkdir(parents=True, exist_ok=True)
     final_figure.savefig(picture_path, dpi=180, bbox_inches="tight")
     import matplotlib.pyplot as plt
     plt.close(final_figure)
+    figure_save_elapsed = time.perf_counter() - figure_save_started
+    summary_started = time.perf_counter()
     append_experiment_summary(summary_path, run_stem, npz_path, picture_path, history_np)
+    summary_elapsed = time.perf_counter() - summary_started
+    end_to_end_elapsed = time.perf_counter() - end_to_end_started
+    dt_total = sum(float(rec["wall_s"]) for rec in dt_timings)
+    contact_error_total = float(args.performance_profile.get("python_contact_error_s", 0.0))
+    record_total = float(args.performance_profile.get("history_record_s", 0.0))
+    loop_other = max(0.0, simulation_loop_elapsed - dt_total - contact_error_total - record_total)
+    print("END-TO-END WALL-CLOCK BREAKDOWN")
+    print(f"  initialization: {initialization_elapsed:.6f} s")
+    print(f"  mesh setup and centerline validation: {mesh_setup_elapsed:.6f} s")
+    print(f"  simulation loop total: {simulation_loop_elapsed:.6f} s")
+    print(f"    implicit dt steps: {dt_total:.6f} s")
+    print(f"    Python contact-error queries: {contact_error_total:.6f} s")
+    print(f"    history records: {record_total:.6f} s")
+    print(f"    other loop/control/printing: {loop_other:.6f} s")
+    print(f"  post-loop summary and array conversion: {args.performance_profile['post_loop_summary_s']:.6f} s")
+    print(f"  compressed NPZ write: {npz_elapsed:.6f} s")
+    print(f"  final figure creation: {figure_create_elapsed:.6f} s")
+    print(f"  final figure save/close: {figure_save_elapsed:.6f} s")
+    print(f"  summary TSV append: {summary_elapsed:.6f} s")
+    print(f"  end-to-end total: {end_to_end_elapsed:.6f} s")
     print(f"history saved: {npz_path}")
     print(f"final report picture saved: {picture_path}")
     print(f"experiment summary appended: {summary_path}")

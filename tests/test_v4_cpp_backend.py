@@ -100,6 +100,43 @@ def _exhaustive_face(point, triangles):
     return best
 
 
+def test_cpp_mesh_accepted_state_uses_predictor_frozen_face():
+    triangles = np.array([
+        [[0.0, 0.0, 0.0], [0.2, 0.0, 0.0], [0.2, 0.0, 0.2]],
+        [[0.0, 0.0, 0.0], [0.2, 0.0, 0.2], [0.0, 0.0, 0.2]],
+        [[0.2, 0.0, 0.0], [0.4, 0.0, 0.0], [0.4, 0.0, 0.2]],
+        [[0.2, 0.0, 0.0], [0.4, 0.0, 0.2], [0.2, 0.0, 0.2]],
+    ], dtype=np.float64)
+    normals = np.array([
+        [0.0, 1.0, 0.0], [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0], [0.0, 0.0, 1.0],
+    ], dtype=np.float64)
+    nodes = 4
+    core = backend.DERCore(
+        np.full(nodes - 1, 0.1, dtype=np.float64),
+        np.full(nodes, 0.01, dtype=np.float64),
+        100.0, 1.0, 0.1, 0.05, 0.001, 3500.0, 0.0, 20.0, 5.0, 0.05,
+    )
+    core.configure_mesh(triangles, normals, np.arange(len(triangles), dtype=np.int64))
+    positions = np.array([
+        [0.0, -0.002, 0.1], [0.1, -0.002, 0.1],
+        [0.195, -0.002, 0.1], [0.3, -0.002, 0.1],
+    ], dtype=np.float64)
+    velocities = np.zeros_like(positions)
+    velocities[2, 0] = 0.1
+    predictor = positions + 0.1 * velocities
+
+    result = core.implicit_euler_step_prescribed_cached(
+        positions, velocities, np.zeros(nodes, dtype=np.float64), positions.copy(),
+        np.zeros_like(positions), True, 0.1, 20, 1.0e-8, 1.0e-12, 0.0,
+    )
+    final_positions = np.asarray(result["positions"])
+
+    assert _exhaustive_face(predictor[2], triangles) == 3
+    assert _exhaustive_face(final_positions[2], triangles) == 0
+    np.testing.assert_allclose(result["contact_force"][2], 0.0, atol=1.0e-12)
+
+
 def test_cpp_mesh_contact_matches_exhaustive_face_force_and_jacobian():
     triangles, normals, triangle_ids = _planar_grid_mesh()
     core = _mesh_core()

@@ -317,8 +317,41 @@ struct MeshContactValue {
   std::int64_t triangle_id = -1;
 };
 
+struct MeshContactFrame {
+  int face = -1;
+  Vec3 normal = Vec3::Zero();
+  Vec3 reference = Vec3::Zero();
+};
+
 int nearest_mesh_face(const Vec3& point, const MeshBVH& mesh_bvh) {
   return mesh_bvh.nearest_face(point);
+}
+
+MeshContactFrame make_mesh_contact_frame(
+    const Vec3& point, int face, const std::vector<Vec3>& triangles,
+    const std::vector<Vec3>& vertex_normals) {
+  MeshContactFrame frame;
+  frame.face = face;
+  if (face < 0) return frame;
+  const Vec3& a = triangles[3 * face];
+  const Vec3& b = triangles[3 * face + 1];
+  const Vec3& c = triangles[3 * face + 2];
+  frame.reference = MeshBVH::closest_point_triangle(point, a, b, c);
+  const Vec3 ab = b - a, ac = c - a, ap = frame.reference - a;
+  const double d00 = ab.dot(ab), d01 = ab.dot(ac), d11 = ac.dot(ac);
+  const double d20 = ap.dot(ab), d21 = ap.dot(ac);
+  const double denominator = std::max(d00 * d11 - d01 * d01, 1.0e-30);
+  const double v = (d11 * d20 - d01 * d21) / denominator;
+  const double w = (d00 * d21 - d01 * d20) / denominator;
+  const double u = 1.0 - v - w;
+  frame.normal = u * vertex_normals[3 * face] +
+                 v * vertex_normals[3 * face + 1] +
+                 w * vertex_normals[3 * face + 2];
+  const double normal_length = frame.normal.norm();
+  if (!std::isfinite(normal_length) || normal_length < 1.0e-12)
+    throw std::runtime_error("interpolated mesh normal is non-finite or degenerate");
+  frame.normal /= normal_length;
+  return frame;
 }
 
 MeshContactValue evaluate_mesh_contact(
@@ -327,15 +360,26 @@ MeshContactValue evaluate_mesh_contact(
     double max_integral_state, double smooth_length,
     const std::vector<Vec3>& triangles, const std::vector<Vec3>& normals,
     const std::vector<std::int64_t>& triangle_ids, const MeshBVH& mesh_bvh,
-    int fixed_face = -1) {
+    int fixed_face = -1, const Vec3* fixed_normal = nullptr,
+    const Vec3* fixed_reference = nullptr) {
   MeshContactValue output;
   if (triangles.empty()) return output;
   // Newton iterations deliberately retain the predicted face.  Only initial
   // and standalone contact searches use the immutable BVH.
   const int best = fixed_face >= 0 ? fixed_face : nearest_mesh_face(point, mesh_bvh);
   if (best < 0) return output;
-  const Vec3 normal = normals[best];
-  const double clearance = normal.dot(point - triangles[3 * best]);
+  Vec3 reference;
+  Vec3 normal;
+  if (fixed_normal != nullptr && fixed_reference != nullptr) {
+    normal = *fixed_normal;
+    reference = *fixed_reference;
+  } else {
+    const MeshContactFrame frame = make_mesh_contact_frame(
+        point, best, triangles, normals);
+    normal = frame.normal;
+    reference = frame.reference;
+  }
+  const double clearance = normal.dot(point - reference);
   const double signed_penetration = -clearance;
   const bool active = signed_penetration > 0.0;
   const double beta = 1.0 / smooth_length;
@@ -618,7 +662,9 @@ struct SolverWorkspace {
         new_velocity(3 * node_count),
         jacobian(free_node_count),
         solve_scratch(free_node_count),
-        mesh_frozen_faces(node_count, -1) {}
+        mesh_frozen_faces(node_count, -1),
+        mesh_frozen_normals(node_count, Vec3::Zero()),
+        mesh_frozen_references(node_count, Vec3::Zero()) {}
 
   void reset_assembly(bool with_jacobian) {
     gradient.setZero();
@@ -636,6 +682,7 @@ struct SolverWorkspace {
   BlockPentaSystem jacobian;
   BlockPentaSolveScratch solve_scratch;
   std::vector<int> mesh_frozen_faces;
+  std::vector<Vec3> mesh_frozen_normals, mesh_frozen_references;
 };
 
 }  // namespace
@@ -681,11 +728,14 @@ void DERCore::configure_mesh(const py::array& triangles, const py::array& normal
       !(triangles.flags() & py::array::c_style)) {
     throw py::type_error("triangles must be a contiguous float64 array of shape (M,3,3)");
   }
-  if (nor.ndim != 2 || nor.shape[0] != tri.shape[0] || nor.shape[1] != 3 ||
+  const bool face_normals = nor.ndim == 2 && nor.shape[0] == tri.shape[0] && nor.shape[1] == 3;
+  const bool vertex_normals = nor.ndim == 3 && nor.shape[0] == tri.shape[0] &&
+                              nor.shape[1] == 3 && nor.shape[2] == 3;
+  if ((!face_normals && !vertex_normals) ||
       nor.format != py::format_descriptor<double>::format() ||
       nor.itemsize != static_cast<ssize_t>(sizeof(double)) ||
       !(normals.flags() & py::array::c_style)) {
-    throw py::type_error("normals must be a contiguous float64 array of shape (M,3)");
+    throw py::type_error("normals must be a contiguous float64 array of shape (M,3) or (M,3,3)");
   }
   if (ids.ndim != 1 || ids.shape[0] != tri.shape[0]) {
     throw py::type_error("triangle_ids must be an int64 array of shape (M,)");
@@ -695,6 +745,7 @@ void DERCore::configure_mesh(const py::array& triangles, const py::array& normal
   const auto* id_ptr = static_cast<const std::int64_t*>(ids.ptr);
   mesh_triangles_.resize(static_cast<std::size_t>(tri.shape[0]) * 3);
   mesh_normals_.resize(static_cast<std::size_t>(tri.shape[0]));
+  mesh_vertex_normals_.resize(static_cast<std::size_t>(tri.shape[0]) * 3);
   mesh_triangle_ids_.resize(static_cast<std::size_t>(tri.shape[0]));
   for (ssize_t face = 0; face < tri.shape[0]; ++face) {
     for (int vertex = 0; vertex < 3; ++vertex) {
@@ -704,11 +755,15 @@ void DERCore::configure_mesh(const py::array& triangles, const py::array& normal
       if (!mesh_triangles_[3 * face + vertex].allFinite())
         throw py::value_error("triangles must contain only finite values");
     }
-    mesh_normals_[face] = Vec3(nor_ptr[face * 3], nor_ptr[face * 3 + 1], nor_ptr[face * 3 + 2]);
-    const double normal_length = mesh_normals_[face].norm();
-    if (!std::isfinite(normal_length) || normal_length < 1.0e-12)
-      throw py::value_error("normals must be finite and non-degenerate");
-    mesh_normals_[face] /= normal_length;
+    for (int vertex = 0; vertex < 3; ++vertex) {
+      const ssize_t normal_index = face_normals ? face * 3 : face * 9 + vertex * 3;
+      Vec3 normal(nor_ptr[normal_index], nor_ptr[normal_index + 1], nor_ptr[normal_index + 2]);
+      const double normal_length = normal.norm();
+      if (!std::isfinite(normal_length) || normal_length < 1.0e-12)
+        throw py::value_error("normals must be finite and non-degenerate");
+      mesh_vertex_normals_[3 * face + vertex] = normal / normal_length;
+    }
+    mesh_normals_[face] = mesh_vertex_normals_[3 * face];
     mesh_triangle_ids_[face] = id_ptr[face];
   }
   mesh_bvh_.build(mesh_triangles_);
@@ -807,6 +862,16 @@ py::dict DERCore::contact_kernel(const py::array& positions,
                                  const py::array& integrals,
                                  const py::array& previous_errors,
                                  double dt, double ki_active) const {
+  return contact_kernel_impl(positions, integrals, previous_errors, dt,
+                             ki_active, nullptr, nullptr, nullptr);
+}
+
+py::dict DERCore::contact_kernel_impl(
+    const py::array& positions, const py::array& integrals,
+    const py::array& previous_errors, double dt, double ki_active,
+    const std::vector<int>* fixed_faces,
+    const std::vector<Vec3>* fixed_normals,
+    const std::vector<Vec3>* fixed_references) const {
   const auto p = checked_array(positions, "positions", 2);
   const auto old_i = checked_array(integrals, "integrals", 1);
   const auto previous = checked_array(previous_errors, "previous_errors", 1);
@@ -840,8 +905,10 @@ py::dict DERCore::contact_kernel(const py::array& positions,
         const MeshContactValue value = evaluate_mesh_contact(
             Vec3(x[3 * n], x[3 * n + 1], x[3 * n + 2]), oi[n], pe[n], dt,
             kp_, ki_active, max_pi_force_, leak_rate_, max_integral_state_,
-            contact_smooth_length_, mesh_triangles_, mesh_normals_, mesh_triangle_ids_,
-            mesh_bvh_);
+            contact_smooth_length_, mesh_triangles_, mesh_vertex_normals_, mesh_triangle_ids_,
+            mesh_bvh_, fixed_faces == nullptr ? -1 : (*fixed_faces)[n],
+            fixed_normals == nullptr ? nullptr : &(*fixed_normals)[n],
+            fixed_references == nullptr ? nullptr : &(*fixed_references)[n]);
         contact = value.value;
         triangle_id = value.triangle_id;
       } else {
@@ -1040,7 +1107,12 @@ py::dict DERCore::implicit_euler_step_prescribed(
       Vec3 predictor = prescribed.segment<3>(3 * n);
       if (n >= first_free && n < last_free)
         predictor = q.segment<3>(3 * (n - first_free));
-      workspace.mesh_frozen_faces[n] = nearest_mesh_face(predictor, mesh_bvh_);
+      const int face = nearest_mesh_face(predictor, mesh_bvh_);
+      const MeshContactFrame frame = make_mesh_contact_frame(
+          predictor, face, mesh_triangles_, mesh_vertex_normals_);
+      workspace.mesh_frozen_faces[n] = frame.face;
+      workspace.mesh_frozen_normals[n] = frame.normal;
+      workspace.mesh_frozen_references[n] = frame.reference;
     }
   }
 
@@ -1049,7 +1121,7 @@ py::dict DERCore::implicit_euler_step_prescribed(
       const MeshContactValue value = evaluate_mesh_contact(
           old_full.segment<3>(3 * n), old_integral[n], 0.0, dt, kp_, ki_active,
           max_pi_force_, leak_rate_, max_integral_state_, contact_smooth_length_,
-          mesh_triangles_, mesh_normals_, mesh_triangle_ids_, mesh_bvh_);
+          mesh_triangles_, mesh_vertex_normals_, mesh_triangle_ids_, mesh_bvh_);
       previous_error(n) = value.value.error;
     } else if (curved_tube_enabled_) {
       previous_error(n) = evaluate_curved_tube_contact(
@@ -1158,8 +1230,9 @@ py::dict DERCore::implicit_euler_step_prescribed(
         const MeshContactValue value = evaluate_mesh_contact(
             full.segment<3>(3 * n), old_integral[n], previous_error(n), dt, kp_,
             ki_active, max_pi_force_, leak_rate_, max_integral_state_,
-            contact_smooth_length_, mesh_triangles_, mesh_normals_, mesh_triangle_ids_,
-            mesh_bvh_, workspace.mesh_frozen_faces[n]);
+            contact_smooth_length_, mesh_triangles_, mesh_vertex_normals_, mesh_triangle_ids_,
+            mesh_bvh_, workspace.mesh_frozen_faces[n],
+            &workspace.mesh_frozen_normals[n], &workspace.mesh_frozen_references[n]);
         contact_force.segment<3>(3 * n) = value.value.force;
         if (with_jacobian) contact_jac[n] = value.value.jacobian;
         continue;
@@ -1331,8 +1404,11 @@ py::dict DERCore::implicit_euler_step_prescribed(
     op[i] = full_result(i);
     ov[i] = new_velocity(i);
   }
-  py::dict contact = contact_kernel(out_positions, integrals, previous_error_array, dt,
-                                    ki_active);
+  py::dict contact = contact_kernel_impl(
+      out_positions, integrals, previous_error_array, dt, ki_active,
+      mesh_enabled_ ? &workspace.mesh_frozen_faces : nullptr,
+      mesh_enabled_ ? &workspace.mesh_frozen_normals : nullptr,
+      mesh_enabled_ ? &workspace.mesh_frozen_references : nullptr);
   const double wall_seconds = std::chrono::duration<double>(
       std::chrono::steady_clock::now() - started).count();
   py::dict result;

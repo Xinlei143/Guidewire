@@ -377,7 +377,7 @@ def _cpp_contact_for_geometry(geometry, positions):
     )
     core.configure_mesh(
         np.ascontiguousarray(geometry.triangles.cpu().numpy(), dtype=np.float64),
-        np.ascontiguousarray(geometry.normals.cpu().numpy(), dtype=np.float64),
+        np.ascontiguousarray(geometry.triangle_vertex_normals.cpu().numpy(), dtype=np.float64),
         np.ascontiguousarray(geometry.triangle_obj_ids.cpu().numpy(), dtype=np.int64),
     )
     return core.contact_kernel(
@@ -419,6 +419,35 @@ def test_python_cpp_rotated_mesh_contact_parity_and_rotation_equivalence(tmp_pat
     assert float(np.dot(base_python["force"][2], points[2] - np.array((0.22, 0.0, 0.0)))) < 0.0
 
 
+def test_python_cpp_smooth_mesh_contact_parity_near_shared_edge(tmp_path):
+    vertices, faces, _ = _swept_tube(
+        ((0.0, 0.0, 0.0), (0.35, 0.0, 0.0), (0.65, 0.18, 0.0)),
+        radius=0.12, sides=8,
+    )
+    geometry = mesh.MeshGeometry.from_obj(
+        _write_indexed_obj(tmp_path / "bent_parity.obj", vertices, faces)
+    )
+    first_face, second_face = 1, 16
+    shared = sorted(set(faces[first_face]) & set(faces[second_face]))
+    first_other = next(index for index in faces[first_face] if index not in shared)
+    second_other = next(index for index in faces[second_face] if index not in shared)
+    edge_midpoint = vertices[shared].mean(axis=0)
+    surface_points = np.stack((
+        edge_midpoint + 1.0e-6 * (vertices[first_other] - edge_midpoint),
+        edge_midpoint + 1.0e-6 * (vertices[second_other] - edge_midpoint),
+    ))
+    query = surface_points - 2.0e-4 * geometry.normals[
+        [first_face, second_face]
+    ].cpu().numpy()
+
+    python_result = _python_contact_for_geometry(geometry, query)
+    cpp_result = _cpp_contact_for_geometry(geometry, query)
+
+    np.testing.assert_allclose(cpp_result["force"], python_result["force"], rtol=1.0e-9, atol=1.0e-11)
+    np.testing.assert_allclose(cpp_result["distances"], python_result["clearance"], rtol=1.0e-9, atol=1.0e-11)
+    np.testing.assert_array_equal(cpp_result["triangle_ids"], python_result["triangle_ids"])
+
+
 def test_mesh_preprocessing_is_one_time_and_not_called_by_runtime_contact(monkeypatch, tmp_path):
     vertices, faces, _ = _swept_tube(((0.0, 0.0, 0.0), (1.0, 0.0, 0.0)), radius=0.2, sides=12)
     geometry = mesh.MeshGeometry.from_obj(_write_indexed_obj(tmp_path / "runtime.obj", vertices, faces))
@@ -444,6 +473,90 @@ def test_mesh_preprocessing_is_one_time_and_not_called_by_runtime_contact(monkey
         )
     assert calls == []
     assert geometry.preprocess_stats == stats
+
+
+def test_mesh_smooth_normal_is_continuous_across_non_coplanar_shared_edge(tmp_path):
+    vertices, faces, _ = _swept_tube(
+        ((0.0, 0.0, 0.0), (0.35, 0.0, 0.0), (0.65, 0.18, 0.0)),
+        radius=0.12, sides=8,
+    )
+    geometry = mesh.MeshGeometry.from_obj(
+        _write_indexed_obj(tmp_path / "bent.obj", vertices, faces)
+    )
+    first_face, second_face = 1, 16
+    shared = sorted(set(faces[first_face]) & set(faces[second_face]))
+    assert len(shared) == 2
+    first_other = next(index for index in faces[first_face] if index not in shared)
+    second_other = next(index for index in faces[second_face] if index not in shared)
+    edge_midpoint = vertices[shared].mean(axis=0)
+    epsilon = 1.0e-6
+    surface_points = np.stack((
+        edge_midpoint + epsilon * (vertices[first_other] - edge_midpoint),
+        edge_midpoint + epsilon * (vertices[second_other] - edge_midpoint),
+    ))
+    inward_hint = geometry.normals[[first_face, second_face]].cpu().numpy()
+    query = torch.as_tensor(surface_points + 1.0e-5 * inward_hint, dtype=torch.float64)
+    details = geometry.nearest(query)
+
+    assert details.triangle_local.tolist() == [first_face, second_face]
+    face_jump = torch.linalg.vector_norm(
+        geometry.normals[first_face] - geometry.normals[second_face]
+    )
+    smooth_jump = torch.linalg.vector_norm(details.normal[0] - details.normal[1])
+    assert float(face_jump) > 0.1
+    assert float(smooth_jump) < 1.0e-4
+    torch.testing.assert_close(details.reference, torch.as_tensor(surface_points), atol=2.0e-8, rtol=0.0)
+
+
+def test_accepted_mesh_diagnostics_reuse_solver_clearance(monkeypatch):
+    args = type("Args", (), {"contact_type": "mesh"})()
+    positions = torch.zeros((3, 3), dtype=torch.float64)
+    accepted_clearance = torch.tensor((0.02, -0.0003, -0.0012), dtype=torch.float64)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("accepted mesh diagnostics must not repeat nearest-face search")
+
+    monkeypatch.setattr(v4, "_mesh_details", forbidden)
+    clearance, protection = v4.contact_diagnostics(
+        positions, args, accepted_clearance=accepted_clearance,
+    )
+
+    torch.testing.assert_close(clearance, accepted_clearance)
+    torch.testing.assert_close(
+        protection, torch.tensor((0.0, 0.0003, 0.0012), dtype=torch.float64)
+    )
+
+
+def test_initial_cpp_mesh_clearance_uses_cpp_bvh(monkeypatch):
+    args = type(
+        "Args", (),
+        {"contact_type": "mesh", "backend": "cpp", "dt": 0.005, "ki_active": 100.0},
+    )()
+    positions = torch.zeros((3, 3), dtype=torch.float64)
+    rest_lengths = torch.ones(2, dtype=torch.float64)
+    masses = torch.ones(3, dtype=torch.float64)
+    expected = np.array((0.05, 0.049, 0.048), dtype=np.float64)
+
+    class FakeCore:
+        def contact_kernel(self, p, integrals, previous_errors, dt, ki_active):
+            np.testing.assert_array_equal(p, positions.numpy())
+            np.testing.assert_array_equal(integrals, np.zeros(3))
+            np.testing.assert_array_equal(previous_errors, np.zeros(3))
+            assert dt == args.dt
+            assert ki_active == args.ki_active
+            return {"distances": expected}
+
+    monkeypatch.setattr(v4, "_get_core", lambda *_args: FakeCore())
+    monkeypatch.setattr(
+        v4, "_mesh_details",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("initial C++ diagnostics must use the C++ BVH")
+        ),
+    )
+
+    actual = v4.initial_accepted_clearance(positions, rest_lengths, masses, args)
+
+    torch.testing.assert_close(actual, torch.as_tensor(expected))
 
 
 def test_mesh_visualization_proxy_is_low_resolution_and_follows_imported_curve():
@@ -583,6 +696,41 @@ def test_v4_python_mesh_backend_completes_one_implicit_step(monkeypatch):
     )
     assert result[0].shape == positions.shape
     assert result[8].converged
+
+
+def test_python_mesh_accepted_state_uses_newton_frozen_topology(monkeypatch):
+    monkeypatch.setattr(
+        v4.sys, "argv", ["v4", "--backend", "python", "--contact-type", "mesh",
+                         "--mesh-obj", str(OBJ), "--num-nodes", "8", "--pulse-count-min", "4",
+                         "--pulse-count-max", "4", "--device", "cpu"]
+    )
+    args = v4._parse_args_with_backend()
+    positions_np, velocities_np, rest_np, masses_np, integrals_np = v4.initialize_rod(
+        args.total_length, args.num_nodes, args.diameter, args.density,
+    )
+    positions = torch.tensor(positions_np, dtype=v4.DTYPE)
+    velocities = torch.tensor(velocities_np, dtype=v4.DTYPE)
+    rest = torch.tensor(rest_np, dtype=v4.DTYPE)
+    masses = torch.tensor(masses_np, dtype=v4.DTYPE)
+    integrals = torch.tensor(integrals_np, dtype=v4.DTYPE)
+    pulse = torch.zeros_like(positions)
+    original_contact_quantities = v4.contact_quantities
+    accepted_topologies = []
+
+    def recording_contact_quantities(current, old_integrals, previous_errors, current_args):
+        if current is not positions and not torch.is_grad_enabled():
+            accepted_topologies.append(getattr(current_args, "_frozen_mesh_topology", None))
+        return original_contact_quantities(current, old_integrals, previous_errors, current_args)
+
+    monkeypatch.setattr(v4, "contact_quantities", recording_contact_quantities)
+    v4._python_implicit_euler_step(
+        positions, velocities, rest, masses, integrals, positions.clone(), pulse,
+        False, 0.0, 0.01, args,
+    )
+
+    assert accepted_topologies
+    assert accepted_topologies[-1] is not None
+    assert args._frozen_mesh_topology is None
 
 
 def test_cpp_mesh_contact_kernel_accepts_external_geometry():

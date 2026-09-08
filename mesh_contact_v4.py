@@ -131,6 +131,46 @@ def _closest_points_on_triangles(
     return closest, torch.where(valid, distance2, torch.full_like(distance2, torch.inf))
 
 
+def _triangle_barycentric_coordinates(
+    points: torch.Tensor, triangles: torch.Tensor,
+) -> torch.Tensor:
+    """Return stable barycentric weights for points known to lie on triangles."""
+    a, b, c = triangles[:, 0], triangles[:, 1], triangles[:, 2]
+    ab, ac, ap = b - a, c - a, points - a
+    d00 = torch.sum(ab * ab, dim=1)
+    d01 = torch.sum(ab * ac, dim=1)
+    d11 = torch.sum(ac * ac, dim=1)
+    d20 = torch.sum(ap * ab, dim=1)
+    d21 = torch.sum(ap * ac, dim=1)
+    denominator = d00 * d11 - d01.square()
+    epsilon = torch.finfo(points.dtype).eps
+    v = (d11 * d20 - d01 * d21) / denominator.clamp_min(epsilon)
+    w = (d00 * d21 - d01 * d20) / denominator.clamp_min(epsilon)
+    weights = torch.stack((1.0 - v - w, v, w), dim=1).clamp_min(0.0)
+    return weights / weights.sum(dim=1, keepdim=True).clamp_min(epsilon)
+
+
+def _angle_weighted_vertex_normals(
+    vertices: np.ndarray, faces: np.ndarray, face_normals: np.ndarray,
+) -> np.ndarray:
+    """Build inward vertex normals shared by every incident oriented face."""
+    accumulated = np.zeros_like(vertices, dtype=np.float64)
+    for corner in range(3):
+        origin = vertices[faces[:, corner]]
+        first = vertices[faces[:, (corner + 1) % 3]] - origin
+        second = vertices[faces[:, (corner + 2) % 3]] - origin
+        first /= np.linalg.norm(first, axis=1)[:, None]
+        second /= np.linalg.norm(second, axis=1)[:, None]
+        angles = np.arccos(np.clip(np.einsum("ij,ij->i", first, second), -1.0, 1.0))
+        np.add.at(accumulated, faces[:, corner], angles[:, None] * face_normals)
+    used = np.unique(faces.reshape(-1))
+    lengths = np.linalg.norm(accumulated[used], axis=1)
+    if np.any(~np.isfinite(lengths)) or np.any(lengths <= _DEGENERATE_TRIANGLE_TOLERANCE):
+        raise ValueError("cannot construct finite smooth normals for protection vertices")
+    accumulated[used] /= lengths[:, None]
+    return accumulated
+
+
 def _parse_obj(path: Path) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
     if not path.is_file():
         raise FileNotFoundError(f"OBJ mesh does not exist: {path}")
@@ -540,6 +580,8 @@ class MeshGeometry:
     face_indices: torch.Tensor
     triangles: torch.Tensor
     normals: torch.Tensor
+    vertex_normals: torch.Tensor
+    triangle_vertex_normals: torch.Tensor
     triangle_obj_ids: torch.Tensor
     cell_size: float
     origin: torch.Tensor
@@ -625,6 +667,10 @@ class MeshGeometry:
         )
         lengths = np.linalg.norm(raw_normals, axis=1)
         normals_np = raw_normals / lengths[:, None]
+        vertex_normals_np = _angle_weighted_vertex_normals(
+            vertices_np, oriented_faces, normals_np,
+        )
+        triangle_vertex_normals_np = vertex_normals_np[oriented_faces]
         edges = np.stack((
             np.linalg.norm(triangles_np[:, 1] - triangles_np[:, 0], axis=1),
             np.linalg.norm(triangles_np[:, 2] - triangles_np[:, 1], axis=1),
@@ -675,6 +721,8 @@ class MeshGeometry:
             face_indices=tensor(faces_np, torch.long),
             triangles=tensor(triangles_np, torch.float64),
             normals=tensor(normals_np, torch.float64),
+            vertex_normals=tensor(vertex_normals_np, torch.float64),
+            triangle_vertex_normals=tensor(triangle_vertex_normals_np, torch.float64),
             triangle_obj_ids=tensor(protection_ids, torch.long),
             cell_size=chosen_cell,
             origin=tensor(lower, torch.float64),
@@ -792,8 +840,14 @@ class MeshGeometry:
         valid_local = local >= 0
         triangles = self.triangles[safe_local]
         closest, d2 = _closest_points_on_triangles(points, triangles[:, None, :, :], valid_local[:, None])
-        reference = triangles[:, 0]
-        normal = self.normals[safe_local]
+        reference = closest[:, 0]
+        barycentric = _triangle_barycentric_coordinates(reference, triangles)
+        smooth = torch.sum(
+            barycentric[:, :, None] * self.triangle_vertex_normals[safe_local], dim=1,
+        )
+        normal = smooth / torch.linalg.vector_norm(smooth, dim=1, keepdim=True).clamp_min(
+            torch.finfo(points.dtype).eps
+        )
         distance = torch.sqrt(d2[:, 0])
         clearance = torch.sum(normal * (points - reference), dim=1)
         obj_ids = self.triangle_obj_ids[safe_local]
