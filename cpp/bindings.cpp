@@ -1,5 +1,6 @@
 #include "der_core.h"
 #include "arc2d_core.h"
+#include "sine2d_core.h"
 
 namespace py = pybind11;
 
@@ -97,5 +98,69 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("reference_curvature"), py::arg("tip_constrained"),
            py::arg("dt"), py::arg("max_newton_iters"),
            py::arg("residual_tol"), py::arg("step_tol"),
+           py::arg("kp_active"), py::arg("ki_active"));
+
+  py::class_<der::Sine2DCore>(m, "Sine2DCore")
+      .def(py::init<const py::array&, const py::array&,
+                    double, double, double, double, double,
+                    double, double, double, double, double,
+                    double, double, double, double, double,
+                    double, double, double, double>(),
+           py::arg("rest_lengths"), py::arg("masses"), py::arg("ea"),
+           py::arg("ei"), py::arg("damping"), py::arg("amplitude"),
+           py::arg("x_span"), py::arg("tube_half_width"),
+           py::arg("safe_distance"), py::arg("feeder_half_width"),
+           py::arg("feeder_contact_layer"), py::arg("feeder_kp_line"),
+           py::arg("contact_kp_line"), py::arg("contact_ki_line"),
+           py::arg("contact_force_cap_line"), py::arg("friction_mu"),
+           py::arg("friction_kt_line"), py::arg("max_integral_state"),
+           py::arg("leak_rate"),
+           py::arg("contact_smooth_length") = 2.0e-5,
+           py::arg("direction_epsilon") = 1.0e-6)
+      .def("geometry_kernel", &der::Sine2DCore::geometry_kernel,
+           py::arg("points"), py::arg("initial_q") = py::none())
+      .def("tracked_geometry_kernel",
+           &der::Sine2DCore::tracked_geometry_kernel,
+           py::arg("points"), py::arg("accepted_q"),
+           py::arg("trust_radius"))
+      .def("contact_kernel",
+           [](const der::Sine2DCore& self, const py::array& positions,
+              const py::array& old_integrals,
+              const py::array& previous_errors,
+              const py::array& nodal_lengths,
+              const py::array& committed_slip,
+              const py::array& increment_start_anchors,
+              const py::array& committed_contact, double dt,
+              bool friction_enabled, py::object kp_active,
+              py::object ki_active, py::object initial_q) {
+             return self.contact_kernel(
+                 positions, old_integrals, previous_errors, nodal_lengths,
+                 committed_slip, increment_start_anchors, committed_contact,
+                 dt, friction_enabled,
+                 kp_active.is_none() ? self.nominal_kp()
+                                     : kp_active.cast<double>(),
+                 ki_active.is_none() ? self.nominal_ki()
+                                     : ki_active.cast<double>(),
+                 initial_q);
+           },
+           py::arg("positions"), py::arg("old_integrals"),
+           py::arg("previous_errors"), py::arg("nodal_lengths"),
+           py::arg("committed_slip"),
+           py::arg("increment_start_anchors"),
+           py::arg("committed_contact"), py::arg("dt"),
+           py::arg("friction_enabled"),
+           py::arg("kp_active") = py::none(),
+           py::arg("ki_active") = py::none(),
+           py::arg("initial_q") = py::none())
+      .def("implicit_euler_step", &der::Sine2DCore::implicit_euler_step,
+           py::arg("positions"), py::arg("velocities"),
+           py::arg("old_integrals"), py::arg("previous_errors"),
+           py::arg("nodal_lengths"), py::arg("prescribed"),
+           py::arg("reference_curvature"), py::arg("committed_slip"),
+           py::arg("increment_start_anchors"),
+           py::arg("committed_contact"), py::arg("friction_enabled"),
+           py::arg("accepted_q"), py::arg("dt"),
+           py::arg("max_newton_iters"), py::arg("residual_tol"),
+           py::arg("step_tol"), py::arg("projection_trust_radius"),
            py::arg("kp_active"), py::arg("ki_active"));
 }

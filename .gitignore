@@ -32,6 +32,9 @@ __pycache__/
 3d_picture
 deliverables
 docs
+!docs/
+docs/*
+!docs/2D正弦三连续弯导丝插入与摩擦Benchmark设计.md
 rodsim_2d_vessel_boundary_PI
 Stretching_bending
 soft_robot_chain_bending_stretching_torsion.py

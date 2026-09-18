@@ -30,7 +30,9 @@ def _load_module():
         str(_ROOT / "cpp" / "der_core.cpp"),
         str(_ROOT / "cpp" / "der_bending.cpp"),
         str(_ROOT / "cpp" / "mesh_bvh.cpp"),
+        str(_ROOT / "cpp" / "planar2d_core_common.cpp"),
         str(_ROOT / "cpp" / "arc2d_core.cpp"),
+        str(_ROOT / "cpp" / "sine2d_core.cpp"),
         str(_ROOT / "cpp" / "bindings.cpp"),
     ]
     digest = hashlib.sha1()
@@ -38,7 +40,9 @@ def _load_module():
         str(_ROOT / "cpp" / "der_core.h"),
         str(_ROOT / "cpp" / "der_bending.h"),
         str(_ROOT / "cpp" / "mesh_bvh.h"),
+        str(_ROOT / "cpp" / "planar2d_core_common.h"),
         str(_ROOT / "cpp" / "arc2d_core.h"),
+        str(_ROOT / "cpp" / "sine2d_core.h"),
     ]:
         digest.update(Path(path).read_bytes())
     name = f"der_core_cpp_{digest.hexdigest()[:12]}"
@@ -63,6 +67,19 @@ def _array(value: Any, name: str) -> np.ndarray:
     result = np.asarray(value)
     if result.dtype != np.float64:
         raise TypeError(f"{name} must have dtype float64")
+    if not result.flags.c_contiguous:
+        raise ValueError(f"{name} must be C-contiguous")
+    return result
+
+
+def _bool_array(value: Any, name: str) -> np.ndarray:
+    if hasattr(value, "detach"):
+        if value.device.type != "cpu":
+            raise ValueError(f"{name} must be a CPU array/tensor")
+        value = value.detach().numpy()
+    result = np.asarray(value)
+    if result.dtype != np.bool_:
+        raise TypeError(f"{name} must have dtype bool")
     if not result.flags.c_contiguous:
         raise ValueError(f"{name} must be C-contiguous")
     return result
@@ -297,4 +314,136 @@ class Arc2DCore:
         return self.implicit_euler_step(*args, **kwargs)
 
 
-__all__ = ["DERCore", "Arc2DCore"]
+class Sine2DCore:
+    """Strict NumPy facade for side-effect-free Sine2D CPU kernels."""
+
+    def __init__(
+        self, rest_lengths, masses, ea, ei, damping, amplitude, x_span,
+        tube_half_width, safe_distance, feeder_half_width,
+        feeder_contact_layer, feeder_kp_line, contact_kp_line,
+        contact_ki_line, contact_force_cap_line, friction_mu,
+        friction_kt_line, max_integral_state, leak_rate,
+        contact_smooth_length=2.0e-5, direction_epsilon=1.0e-6,
+    ):
+        # Keep facade-owned snapshots as well as the C++ vectors so caller
+        # mutation can never alter the cached physical state.
+        self._rest_lengths = _array(rest_lengths, "rest_lengths").copy()
+        self._masses = _array(masses, "masses").copy()
+        self._kp = float(contact_kp_line)
+        self._ki = float(contact_ki_line)
+        self._impl = _load_module().Sine2DCore(
+            self._rest_lengths,
+            self._masses,
+            float(ea),
+            float(ei),
+            float(damping),
+            float(amplitude),
+            float(x_span),
+            float(tube_half_width),
+            float(safe_distance),
+            float(feeder_half_width),
+            float(feeder_contact_layer),
+            float(feeder_kp_line),
+            self._kp,
+            self._ki,
+            float(contact_force_cap_line),
+            float(friction_mu),
+            float(friction_kt_line),
+            float(max_integral_state),
+            float(leak_rate),
+            float(contact_smooth_length),
+            float(direction_epsilon),
+        )
+
+    @staticmethod
+    def _initial_q(initial_q, count):
+        if initial_q is None:
+            return None
+        value = _array(initial_q, "initial_q")
+        if value.ndim == 0:
+            return np.full(count, float(value), dtype=np.float64)
+        if value.shape != (count,):
+            raise ValueError(f"initial_q must have shape ({count},)")
+        return value
+
+    def geometry_kernel(self, points, initial_q=None):
+        points = _array(points, "points")
+        if points.ndim != 2 or points.shape[1:] != (2,):
+            raise ValueError("points must have shape (N, 2)")
+        return self._impl.geometry_kernel(
+            points, self._initial_q(initial_q, len(points))
+        )
+
+    def tracked_geometry_kernel(self, points, accepted_q, trust_radius):
+        points = _array(points, "points")
+        if points.ndim != 2 or points.shape[1:] != (2,):
+            raise ValueError("points must have shape (N, 2)")
+        return self._impl.tracked_geometry_kernel(
+            points,
+            self._initial_q(accepted_q, len(points)),
+            float(trust_radius),
+        )
+
+    def contact_kernel(
+        self, positions, old_integrals, previous_errors, nodal_lengths,
+        committed_slip, increment_start_anchors, committed_contact, dt,
+        friction_enabled=True, kp_active=None, ki_active=None, initial_q=None,
+    ):
+        positions = _array(positions, "positions")
+        if positions.ndim != 2 or positions.shape[1:] != (2,):
+            raise ValueError("positions must have shape (N, 2)")
+        if not isinstance(friction_enabled, bool):
+            raise TypeError("friction_enabled must be bool")
+        count = len(positions)
+        return self._impl.contact_kernel(
+            positions,
+            _array(old_integrals, "old_integrals"),
+            _array(previous_errors, "previous_errors"),
+            _array(nodal_lengths, "nodal_lengths"),
+            _array(committed_slip, "committed_slip"),
+            _array(increment_start_anchors, "increment_start_anchors"),
+            _bool_array(committed_contact, "committed_contact"),
+            float(dt),
+            friction_enabled,
+            self._kp if kp_active is None else float(kp_active),
+            self._ki if ki_active is None else float(ki_active),
+            self._initial_q(initial_q, count),
+        )
+
+    def implicit_euler_step(
+        self, positions, velocities, old_integrals, previous_errors,
+        nodal_lengths, prescribed, reference_curvature, committed_slip,
+        increment_start_anchors, committed_contact, friction_enabled,
+        accepted_q, dt, max_newton_iters, residual_tol, step_tol,
+        projection_trust_radius, kp_active=None, ki_active=None,
+    ):
+        positions = _array(positions, "positions")
+        count = len(positions)
+        if positions.shape != (count, 2):
+            raise ValueError("positions must have shape (N, 2)")
+        if not isinstance(friction_enabled, bool):
+            raise TypeError("friction_enabled must be bool")
+        return self._impl.implicit_euler_step(
+            positions,
+            _array(velocities, "velocities"),
+            _array(old_integrals, "old_integrals"),
+            _array(previous_errors, "previous_errors"),
+            _array(nodal_lengths, "nodal_lengths"),
+            _array(prescribed, "prescribed"),
+            _array(reference_curvature, "reference_curvature"),
+            _array(committed_slip, "committed_slip"),
+            _array(increment_start_anchors, "increment_start_anchors"),
+            _bool_array(committed_contact, "committed_contact"),
+            friction_enabled,
+            _array(accepted_q, "accepted_q"),
+            float(dt),
+            int(max_newton_iters),
+            float(residual_tol),
+            float(step_tol),
+            float(projection_trust_radius),
+            self._kp if kp_active is None else float(kp_active),
+            self._ki if ki_active is None else float(ki_active),
+        )
+
+
+__all__ = ["DERCore", "Arc2DCore", "Sine2DCore"]

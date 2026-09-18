@@ -307,6 +307,10 @@ signed volume，初始化会明确报错而不会猜测 lumen 方向。
 
 ```text
 rod_soft_contact_PI_dynamic_quasi_static_3d_v4.py  v4 主入口、实验管理和可视化
+rod_soft_contact_PI_dynamic_quasi_static_2d_sine_insert.py  2-D 正弦管插入入口
+sine_tube_2d.py                                    正弦中心线、壁面与投影
+sine2d_benchmark_io.py                             单次运行 TSV/NPZ/PNG 输出
+sine2d_benchmark_campaign.py                       收敛与摩擦扫描编排
 mesh_contact_v4.py                                 OBJ/STL 网格解析与接触几何
 der_cpp_backend.py                                 C++ 扩展的 Python 边界
 cpp/                                                Eigen/C++ DER 核心和构建脚本
@@ -317,3 +321,62 @@ Stretching_bending/                                 旧的 Torch cantilever 示�
 
 旧的 `Stretching_bending/` 示例仍可单独运行，但它不包含 v4 的 PI 接触、OBJ
 网格、续加载或 C++ backend，不应与本 README 的 v4 命令混用。
+
+## 8. 2-D 正弦三连续弯导丝插入 Benchmark
+
+新的独立入口
+`rod_soft_contact_PI_dynamic_quasi_static_2d_sine_insert.py` 在恒宽正弦管内从
+半无限直线 feeder 送入自然直导丝。默认算例使用 800 节点、60 个载荷步、
+1.50 m 总插入量和 `mu=0.10`；PI 法向接触、feeder penalty 与切向刚度均按
+节点 Voronoi 长度从线密度参数换算。单次运行命令为：
+
+```bash
+MPLBACKEND=Agg MPLCONFIGDIR=/tmp/softrobot-mplconfig \
+conda run --no-capture-output -n pendulum-rl python -u \
+  rod_soft_contact_PI_dynamic_quasi_static_2d_sine_insert.py \
+  --backend cpp --output-dir 2d_npz --run-name sine_nominal_cpp
+```
+
+Python CPU 路径用于数学参考与小规模排错：
+
+```bash
+MPLBACKEND=Agg MPLCONFIGDIR=/tmp/softrobot-mplconfig \
+conda run --no-capture-output -n pendulum-rl python -u \
+  rod_soft_contact_PI_dynamic_quasi_static_2d_sine_insert.py \
+  --backend python --num-nodes 120 --num-load-steps 8 \
+  --output-dir 2d_npz --run-name sine_python_reference_short
+```
+
+每个 `output-dir/run-name/` 独立保存 `config.json`、`settled.tsv`、
+`history.npz`、构型、插入力、接触合力与弹性能图。插入力只有一个定义：近端
+两个约束节点静态反力之和的负 x 分量；壁面合力不会再次加到该量上。Stretching
+和 bending 构成 elastic energy，PI 与 Coulomb friction 是非保守力。
+
+正式空间/时间收敛与四个摩擦系数扫描由独立 campaign 入口运行：
+
+```bash
+MPLBACKEND=Agg MPLCONFIGDIR=/tmp/softrobot-mplconfig \
+conda run --no-capture-output -n pendulum-rl python -u \
+  sine2d_benchmark_campaign.py \
+  --backend cpp --study all --output-dir 2d_npz \
+  --campaign-name sine2d_formal_YYYYMMDD
+```
+
+campaign 先运行 `400/800/1200` 节点（60 步）和 800 节点的 `60/120` 步
+对照；仅对未通过的维度追加 1600 节点或 240 步。`mu=0,0.05,0.10,0.20`
+扫描在统一插入位移网格（均匀点与全部源曲线 knot 的有序并集）写入 TSV，
+并生成四条插入力曲线叠加图。为防止把不同
+配置混到同一证据目录，campaign 拒绝已存在的目录；重跑时必须使用新的
+`--campaign-name`。默认 `2d_npz/` 已被 Git 忽略，程序不会提交或推送产物。
+
+`campaign_manifest.json` 中只有当曲线 L2、峰值、末值、tip 弧长与最大穿透
+全部满足门槛且所请求的扫描完整时才写为 `converged`；收敛失败保留为
+`not_converged`，扫描不完整保留为 `campaign_incomplete`，不得据此宣称完成
+定量验证。运行器/导出异常、载荷步数不全或 settled 曲线未到达总插入量也只标记为
+`campaign_incomplete`，不会被错当作数值 `not_converged`。单次导出还会强制检查
+feeder x 合力严格为零，并要求 settled 状态的
+inertia/damping remainder 不超过 actuator force 范数的 5%。这里的 `mu=0.10` 与
+line-density 参数只是仿真名义系数和历史离散
+尺度复现，不是材料实验标定，也不构成器械安全或临床有效性证据。
+完整公式、状态提交与复现约束见
+[`docs/2D正弦三连续弯导丝插入与摩擦Benchmark设计.md`](docs/2D正弦三连续弯导丝插入与摩擦Benchmark设计.md)。
