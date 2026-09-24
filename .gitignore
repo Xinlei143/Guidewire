@@ -43,3 +43,7 @@ soft_robot_chain_bending_stretching_torsion.py
 # Reproducible portfolio evidence: keep only the lightweight provenance manifest.
 portfolio_evidence/*
 !portfolio_evidence/manifest.json
+
+# Local report bundle and historical guidewire archive; not part of Git backups.
+/wire_report/
+/血管导丝/

@@ -62,16 +62,23 @@ class StraightFreeInsertConfig:
     max_settle_steps: int = 16_000
     prebalance_max_steps: int = 16_000
     ramp_steps: int = 25
-    total_insertion: float = 90.0e-3
-    num_load_steps: int = 20
+    total_insertion: float = 360.0e-3
+    num_load_steps: int = 80
     retry_subdivisions: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128)
     ki_reduction_factor: float = 0.5
     ki_min_scale: float = 0.125
     diagnostic_interval: int = 50
     progress: bool = True
 
-    output_dir: str = "3d_npz/straight_free_insert"
-    run_name: str = "straight_free_insert"
+    # Rendering only: the analytic straight-tube contact remains axially
+    # unbounded and has no artificial end-cap forces.
+    display_vessel_margin: float = 50.0e-3
+    tracking_view_margin: float = 100.0e-3
+    animation_fps: int = 5
+    write_animation: bool = True
+
+    output_dir: str = "3d_npz/straight_free_insert_360mm"
+    run_name: str = "straight_free_insert_360mm"
 
     def __post_init__(self) -> None:
         positive = (
@@ -82,6 +89,7 @@ class StraightFreeInsertConfig:
             "contact_active_weight", "direction_epsilon", "friction_kt_line", "dt", "residual_tol",
             "step_tol", "settle_speed_tol", "settle_residual_tol",
             "contact_tolerance", "total_insertion", "ki_reduction_factor", "ki_min_scale",
+            "display_vessel_margin", "tracking_view_margin",
         )
         for name in positive:
             value = getattr(self, name)
@@ -106,12 +114,14 @@ class StraightFreeInsertConfig:
         for name in (
             "max_newton_iters", "settle_confirm_steps", "max_settle_steps",
             "prebalance_max_steps", "ramp_steps", "num_load_steps",
-            "diagnostic_interval",
+            "diagnostic_interval", "animation_fps",
         ):
             if not isinstance(getattr(self, name), int) or getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be a positive integer")
         if self.total_insertion >= self.total_length:
             raise ValueError("total_insertion must be smaller than total_length")
+        if not isinstance(self.write_animation, bool):
+            raise ValueError("write_animation must be a boolean")
 
 
 def reduced_contact_ki_config(
@@ -193,6 +203,58 @@ def make_prescribed_state(initial: np.ndarray, displacement: float) -> Prescribe
     positions = np.array(initial, dtype=np.float64, copy=True)
     positions[-2:, 0] -= displacement
     return PrescribedState(mask=mask, positions=positions)
+
+
+def display_vessel_axial_bounds(config: StraightFreeInsertConfig) -> tuple[float, float]:
+    """Return finite *display* bounds covering the full planned insertion.
+
+    The contact model remains an axially unbounded analytic cylinder.  These
+    bounds are deliberately an output contract only: they make the rendered
+    blood-vessel segment long enough to contain the whole wire in every saved
+    snapshot without introducing end-cap forces into the solver.
+    """
+    return (
+        -config.total_insertion - config.display_vessel_margin,
+        config.total_length + config.display_vessel_margin,
+    )
+
+
+def validate_display_vessel_history(
+    history: dict[str, np.ndarray], config: StraightFreeInsertConfig
+) -> None:
+    """Reject output whose guidewire leaves the finite rendered vessel."""
+    positions = np.asarray(history.get("positions"))
+    if positions.ndim != 3 or positions.shape[1:] != (config.num_nodes, 3):
+        raise ValueError("history positions must have shape snapshots-by-N-by-3")
+    if not np.isfinite(positions).all():
+        raise ValueError("history positions must be finite")
+    vessel_start, vessel_end = display_vessel_axial_bounds(config)
+    wire_start = float(positions[..., 0].min())
+    wire_end = float(positions[..., 0].max())
+    tolerance = 1.0e-12
+    if wire_start < vessel_start - tolerance or wire_end > vessel_end + tolerance:
+        raise ValueError(
+            "guidewire lies outside the finite display vessel: "
+            f"wire=[{wire_start:.6g}, {wire_end:.6g}], "
+            f"vessel=[{vessel_start:.6g}, {vessel_end:.6g}]"
+        )
+
+
+def guidewire_tracking_camera_bounds(
+    positions: np.ndarray, config: StraightFreeInsertConfig
+) -> tuple[float, float, float]:
+    """Return a fixed-size camera window centered on the whole guidewire."""
+    nodes = np.asarray(positions)
+    if nodes.shape != (config.num_nodes, 3) or not np.isfinite(nodes).all():
+        raise ValueError("positions must be finite N-by-3 guidewire coordinates")
+    x_start = float(nodes[:, 0].min())
+    x_end = float(nodes[:, 0].max())
+    half_span = 0.5 * config.total_length + config.tracking_view_margin
+    if x_end - x_start > 2.0 * half_span + 1.0e-12:
+        raise ValueError("guidewire span does not fit in the fixed tracking window")
+    center = 0.5 * (x_start + x_end)
+    radial_limit = 1.25 * config.tube_radius
+    return center - half_span, center + half_span, radial_limit
 
 
 @functools.lru_cache(maxsize=8)
@@ -820,12 +882,14 @@ class SimulationResult:
     settled_path: Path
     history_path: Path
     figure_path: Path
+    animation_path: Path | None
 
 
 @dataclass(frozen=True)
 class ComparisonResult:
     results: dict[float, SimulationResult]
     figure_path: Path
+    animation_path: Path | None
 
 
 def _tensor(value: np.ndarray) -> torch.Tensor:
@@ -979,6 +1043,91 @@ def _history_arrays(records: list[dict[str, object]]) -> dict[str, np.ndarray]:
     return {key: np.asarray([record[key] for record in records]) for key in records[0]}
 
 
+def _draw_display_vessel(axis, config: StraightFreeInsertConfig) -> None:
+    """Draw the finite, transparent vessel used for output only."""
+    x_start, x_end = display_vessel_axial_bounds(config)
+    x = np.linspace(x_start, x_end, 2)
+    angle = np.linspace(0.0, 2.0 * np.pi, 40)
+    xx, theta = np.meshgrid(x, angle, indexing="ij")
+    axis.plot_surface(
+        xx,
+        config.tube_radius * np.cos(theta),
+        config.tube_radius * np.sin(theta),
+        color="tab:gray",
+        alpha=0.13,
+        linewidth=0.0,
+        shade=False,
+    )
+    axis.plot(x, np.zeros_like(x), np.zeros_like(x), "k:", linewidth=0.8)
+    for endpoint in (x_start, x_end):
+        axis.plot(
+            np.full_like(angle, endpoint),
+            config.tube_radius * np.cos(angle),
+            config.tube_radius * np.sin(angle),
+            color="0.35",
+            linewidth=0.8,
+        )
+
+
+def _configure_tracking_axis(axis, positions: np.ndarray, config: StraightFreeInsertConfig) -> None:
+    x_start, x_end, radial_limit = guidewire_tracking_camera_bounds(positions, config)
+    axis.set_xlim(x_start, x_end)
+    axis.set_ylim(-radial_limit, radial_limit)
+    axis.set_zlim(-radial_limit, radial_limit)
+    # Keep coordinate limits physical, but enlarge the radial display aspect so
+    # a 1.5 m guidewire inside a 60 mm vessel stays legible in a GIF.
+    axis.set_box_aspect((4.0, 1.0, 1.0))
+    axis.set_proj_type("ortho")
+    axis.view_init(elev=18.0, azim=-58.0)
+    axis.set_xlabel("x [m]")
+    axis.set_ylabel("y [m]")
+    axis.set_zlabel("z [m]")
+    axis.grid(False)
+
+
+def _draw_tracking_frame(
+    axis,
+    history: dict[str, np.ndarray],
+    config: StraightFreeInsertConfig,
+    frame: int,
+    label: str,
+) -> None:
+    axis.clear()
+    _draw_display_vessel(axis, config)
+    reference = history["positions"][0]
+    current = history["positions"][frame]
+    axis.plot(*reference.T, "k--", linewidth=1.0, label="prebalanced reference")
+    axis.plot(*current.T, color="tab:blue", linewidth=1.8, label="current guidewire")
+    _configure_tracking_axis(axis, current, config)
+    actuator = history["actuator_displacement_m"][frame] * 1.0e3
+    tip = history["free_tip_advance_m"][frame] * 1.0e3
+    axis.set_title(f"{label}: actuator={actuator:.1f} mm, free tip={tip:.1f} mm")
+    axis.legend(loc="upper left", fontsize=8)
+
+
+def _write_single_animation(
+    history: dict[str, np.ndarray], config: StraightFreeInsertConfig, path: Path
+) -> Path:
+    """Render a whole-wire tracking GIF against the stationary vessel."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.animation import FuncAnimation, PillowWriter
+
+    validate_display_vessel_history(history, config)
+    figure = plt.figure(figsize=(8, 4.5))
+    axis = figure.add_subplot(1, 1, 1, projection="3d")
+    frame_count = len(history["positions"])
+
+    def draw(frame: int):
+        _draw_tracking_frame(axis, history, config, frame, f"mu={config.friction_mu:g}")
+
+    animation = FuncAnimation(figure, draw, frames=frame_count, interval=1_000 / config.animation_fps)
+    animation.save(path, writer=PillowWriter(fps=config.animation_fps), dpi=100)
+    plt.close(figure)
+    return path
+
+
 def _write_single_figure(
     history: dict[str, np.ndarray], config: StraightFreeInsertConfig, path: Path
 ) -> None:
@@ -988,8 +1137,12 @@ def _write_single_figure(
 
     figure = plt.figure(figsize=(12, 8))
     axis = figure.add_subplot(2, 2, 1, projection="3d")
+    _draw_display_vessel(axis, config)
     axis.plot(*history["positions"][0].T, "k--", label="prebalanced")
     axis.plot(*history["positions"][-1].T, color="tab:blue", label="final")
+    vessel_start, vessel_end = display_vessel_axial_bounds(config)
+    radial_limit = 1.25 * config.tube_radius
+    axis.set(xlim=(vessel_start, vessel_end), ylim=(-radial_limit, radial_limit), zlim=(-radial_limit, radial_limit))
     axis.set_title(f"3-D configuration, mu={config.friction_mu:g}")
     axis.set_xlabel("x [m]")
     axis.set_ylabel("y [m]")
@@ -1172,21 +1325,23 @@ def run_simulation(config: StraightFreeInsertConfig) -> SimulationResult:
                 phase_label=f"load {load_step}/{config.num_load_steps}, relaxation {relaxation}",
             )
             equilibrium = _settled(result, active_config)
+            stable = stable + 1 if equilibrium else 0
+            should_print_diagnostics = (
+                relaxation % config.diagnostic_interval == 0
+                or stable >= config.settle_confirm_steps
+            )
             dynamic_ratio: float | None = None
-            if equilibrium:
+            if should_print_diagnostics:
+                # Diagnostic only.  Do not use actuator-normalized dynamic ratio as a
+                # settling criterion because the actuator reaction may legitimately
+                # approach zero in free-insertion / zero-friction configurations.
                 candidate_diagnostics = _diagnostics(
                     state[0], result.dynamic_force, rest_lengths, masses,
                     state[2], state[3], nodal_lengths, context, active_config, target,
                     prebalanced_reference, True, effective_ki_scale,
                 )
-                equilibrium = dynamic_balance_acceptable(
-                    float(candidate_diagnostics["dynamic_remainder_n"]),
-                    float(candidate_diagnostics["push_force_n"]),
-                    active_config.settle_residual_tol,
-                )
                 dynamic_ratio = float(candidate_diagnostics["dynamic_to_push_ratio"])
-            stable = stable + 1 if equilibrium else 0
-            if relaxation % config.diagnostic_interval == 0 or stable >= config.settle_confirm_steps:
+            if should_print_diagnostics:
                 free_speed = float(torch.linalg.vector_norm(result.velocities[:-2], dim=1).max())
                 progress(
                     f"[RELAX {load_step:02d}/{config.num_load_steps:02d} | {relaxation:5d}] "
@@ -1217,7 +1372,13 @@ def run_simulation(config: StraightFreeInsertConfig) -> SimulationResult:
             f"| Ki_eff={active_config.contact_ki:g}"
         )
     history = _history_arrays(records)
+    validate_display_vessel_history(history, config)
     paths = _write_outputs(config, history)
+    animation_path = None
+    if config.write_animation:
+        animation_path = _write_single_animation(
+            history, config, Path(config.output_dir) / "guidewire_follow.gif"
+        )
     return SimulationResult(
         config=config,
         history=history,
@@ -1227,6 +1388,7 @@ def run_simulation(config: StraightFreeInsertConfig) -> SimulationResult:
         settled_path=paths[1],
         history_path=paths[2],
         figure_path=paths[3],
+        animation_path=animation_path,
     )
 
 
@@ -1237,8 +1399,13 @@ def _write_comparison_figure(results: dict[float, SimulationResult], path: Path)
 
     figure = plt.figure(figsize=(15, 8))
     axis3d = figure.add_subplot(2, 3, 1, projection="3d")
+    config = next(iter(results.values())).config
+    _draw_display_vessel(axis3d, config)
     for mu, result in sorted(results.items()):
         axis3d.plot(*result.history["positions"][-1].T, label=f"mu={mu:g}")
+    vessel_start, vessel_end = display_vessel_axial_bounds(config)
+    radial_limit = 1.25 * config.tube_radius
+    axis3d.set(xlim=(vessel_start, vessel_end), ylim=(-radial_limit, radial_limit), zlim=(-radial_limit, radial_limit))
     axis3d.set_title("Final 3-D configuration")
     axis3d.legend()
     panels = (
@@ -1261,6 +1428,40 @@ def _write_comparison_figure(results: dict[float, SimulationResult], path: Path)
     plt.close(figure)
 
 
+def _write_comparison_animation(
+    results: dict[float, SimulationResult], path: Path
+) -> Path:
+    """Render the paired mu=0/mu=1 whole-guidewire tracking animation."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.animation import FuncAnimation, PillowWriter
+
+    ordered = sorted(results.items())
+    if len(ordered) != 2:
+        raise ValueError("comparison GIF requires exactly two friction cases")
+    frame_count = len(ordered[0][1].history["positions"])
+    for _, result in ordered:
+        validate_display_vessel_history(result.history, result.config)
+        if len(result.history["positions"]) != frame_count:
+            raise ValueError("comparison GIF requires matching settled snapshot counts")
+    figure = plt.figure(figsize=(12, 4.5))
+    axes = [figure.add_subplot(1, 2, index + 1, projection="3d") for index in range(2)]
+    caption = figure.suptitle("")
+
+    def draw(frame: int):
+        for axis, (mu, result) in zip(axes, ordered):
+            _draw_tracking_frame(axis, result.history, result.config, frame, f"mu={mu:g}")
+        actuator = ordered[0][1].history["actuator_displacement_m"][frame] * 1.0e3
+        caption.set_text(f"Whole-guidewire tracking view | actuator displacement={actuator:.1f} mm")
+
+    config = ordered[0][1].config
+    animation = FuncAnimation(figure, draw, frames=frame_count, interval=1_000 / config.animation_fps)
+    animation.save(path, writer=PillowWriter(fps=config.animation_fps), dpi=100)
+    plt.close(figure)
+    return path
+
+
 def run_comparison(
     base_config: StraightFreeInsertConfig,
     mus: Iterable[float] = (0.0, 1.0),
@@ -1280,17 +1481,28 @@ def run_comparison(
     comparison_path = root / "comparison.png"
     root.mkdir(parents=True, exist_ok=True)
     _write_comparison_figure(results, comparison_path)
-    return ComparisonResult(results=results, figure_path=comparison_path)
+    animation_path = None
+    if base_config.write_animation:
+        animation_path = _write_comparison_animation(
+            results, root / "comparison_guidewire_follow.gif"
+        )
+    return ComparisonResult(
+        results=results,
+        figure_path=comparison_path,
+        animation_path=animation_path,
+    )
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    defaults = StraightFreeInsertConfig()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--num-nodes", type=int, default=250)
-    parser.add_argument("--total-insertion", type=float, default=90.0e-3)
-    parser.add_argument("--num-load-steps", type=int, default=20)
+    parser.add_argument("--num-nodes", type=int, default=defaults.num_nodes)
+    parser.add_argument("--total-insertion", type=float, default=defaults.total_insertion)
+    parser.add_argument("--num-load-steps", type=int, default=defaults.num_load_steps)
     parser.add_argument("--friction-mu", type=float, default=1.0)
-    parser.add_argument("--output-dir", default="3d_npz/straight_free_insert")
+    parser.add_argument("--output-dir", default=defaults.output_dir)
     parser.add_argument("--single", action="store_true", help="run one mu instead of the default mu=0/1 comparison")
+    parser.add_argument("--no-animation", action="store_true", help="skip GIF rendering after the settled solve")
     return parser.parse_args(argv)
 
 
@@ -1302,6 +1514,7 @@ def main(argv: list[str] | None = None) -> int:
         num_load_steps=args.num_load_steps,
         friction_mu=args.friction_mu,
         output_dir=args.output_dir,
+        write_animation=not args.no_animation,
     )
     if args.single:
         result = run_simulation(config)
