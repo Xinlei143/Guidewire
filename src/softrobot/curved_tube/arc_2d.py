@@ -1755,6 +1755,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def main(argv=None) -> None:
+    from .._tube_smoke import run_smoke
+    smoke_result = run_smoke(argv, "curved-tube-2d-arc")
+    if smoke_result >= 0:
+        return smoke_result
     with cli_arguments(argv):
         parsed = parse_args()
         run_self_test(parsed) if parsed.self_test else None

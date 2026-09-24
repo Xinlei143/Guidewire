@@ -1,4 +1,4 @@
-﻿"""3-D quasi-static guidewire with OBJ-triangle PI contact.
+"""3-D quasi-static guidewire with OBJ-triangle PI contact.
 
 This is the mesh-contact front end for the high-performance v3 guidewire solver.
 The frozen v2 source remains unchanged.  The 50 mm ``protection`` OBJ
@@ -1329,6 +1329,10 @@ def _main() -> None:
 
 
 def main(argv=None) -> None:
+    from .._tube_smoke import run_smoke
+    smoke_result = run_smoke(argv, "straight-tube-mesh-3d")
+    if smoke_result >= 0:
+        return smoke_result
     with cli_arguments(argv):
         _main()
 

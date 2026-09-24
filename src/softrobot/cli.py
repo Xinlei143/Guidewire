@@ -42,6 +42,39 @@ def _absolutize_input_paths(arguments: Sequence[str], option_names: Sequence[str
     return rewritten
 
 
+def _option_name(argument: str) -> str | None:
+    if not argument.startswith("--"):
+        return None
+    return argument.split("=", 1)[0]
+
+
+def _merge_default_model_args(defaults: Sequence[str], explicit: Sequence[str]) -> list[str]:
+    """Prepend preset arguments except options explicitly supplied by the user."""
+    explicit_names = {_option_name(value) for value in explicit}
+    merged: list[str] = []
+    index = 0
+    while index < len(defaults):
+        argument = defaults[index]
+        name = _option_name(argument)
+        inline = "=" in argument
+        has_value = not inline and index + 1 < len(defaults) and not defaults[index + 1].startswith("--")
+        if name not in explicit_names:
+            merged.append(argument)
+            if has_value:
+                merged.append(defaults[index + 1])
+        index += 2 if has_value else 1
+    return [*merged, *explicit]
+
+
+def _resolve_preset_resources(arguments: Sequence[str]) -> list[str]:
+    resource_root = Path(__file__).resolve().parent / "resources" / "tube_obj"
+    replacements = {
+        "__ARC_CENTERLINE__": str(resource_root / "arc90_L1p5m_centerline_800.csv"),
+        "__ARC_MESH__": str(resource_root / "arc90_L1p5m_xz_wallR60mm_protectionR50mm_64sides_axial256.obj"),
+    }
+    return [replacements.get(value, value) for value in arguments]
+
+
 def _absolute_path(value: str, base_directory: Path) -> Path:
     path = Path(value).expanduser()
     if not path.is_absolute():
@@ -112,11 +145,11 @@ def _run_all_smokes(output_directory: Path) -> int:
         try:
             result = subprocess.run(
                 command, capture_output=True, text=True, env=environment,
-                timeout=model.timeout_s,
+                timeout=model.smoke_timeout_s,
             )
         except subprocess.TimeoutExpired:
             result_path.unlink(missing_ok=True)
-            error = f"timed out after {model.timeout_s:g} seconds"
+            error = f"timed out after {model.smoke_timeout_s:g} seconds"
             summary["failed"].append({"model_id": model_id, "error": error})
             print(f"FAILED {model_id}: {error}")
             continue
@@ -172,13 +205,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         model_args.append("--help")
     if args.smoke_test and not model.smoke_test:
         parser.error(f"model {model.model_id!r} does not implement the common --smoke-test contract yet")
+    model_args = _merge_default_model_args(model.default_model_args, model_args)
+    model_args = _resolve_preset_resources(model_args)
     model_args = _absolutize_input_paths(model_args, model.input_path_options, invocation_directory)
     output_directory = _absolute_path(str(args.output_dir), invocation_directory)
     output_directory.mkdir(parents=True, exist_ok=True)
     if args.smoke_test:
         model_args.extend(("--smoke-test", "--output-dir", "."))
-    with _working_directory(output_directory):
-        result = model.load_main()(model_args)
+    previous_model_id = os.environ.get("SOFTROBOT_SMOKE_MODEL_ID")
+    if args.smoke_test:
+        os.environ["SOFTROBOT_SMOKE_MODEL_ID"] = model.model_id
+    try:
+        with _working_directory(output_directory):
+            result = model.load_main()(model_args)
+    finally:
+        if args.smoke_test:
+            if previous_model_id is None:
+                os.environ.pop("SOFTROBOT_SMOKE_MODEL_ID", None)
+            else:
+                os.environ["SOFTROBOT_SMOKE_MODEL_ID"] = previous_model_id
     return 0 if result is None else result
 
 

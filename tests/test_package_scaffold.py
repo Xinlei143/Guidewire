@@ -11,12 +11,19 @@ EXPECTED_MODEL_IDS = (
     "contact-2d-quasistatic-pi-v1",
     "contact-2d-quasistatic-pi-v2",
     "curved-tube-2d-arc",
+    "curved-tube-2d-legacy-python",
+    "curved-tube-3d-legacy-analytic",
+    "curved-tube-3d-legacy-mesh",
+    "curved-tube-v4-analytic",
+    "curved-tube-v4-mesh",
     "foundation-2d-stretch-bend-torch",
     "foundation-2d-stretch-numpy",
     "foundation-3d-implicit-newton",
     "foundation-3d-stretch-bend-torch",
     "foundation-cantilever-der",
+    "straight-tube-2d-pi",
     "straight-tube-mesh-3d",
+    "straight-tube-v2-3d",
     "straight-tube-v3",
     "straight-tube-v4",
 )
@@ -38,14 +45,10 @@ def test_cli_models_prints_one_registered_id_per_line(capsys: pytest.CaptureFixt
 def test_cli_run_accepts_common_options_after_model_id(tmp_path: Path) -> None:
     from softrobot.cli import main
 
-    with pytest.raises(SystemExit, match="2"):
-        main([
-            "run",
-            "straight-tube-v4",
-            "--smoke-test",
-            "--output-dir",
-            str(tmp_path),
-        ])
+    assert main([
+        "run", "straight-tube-v3", "--smoke-test", "--output-dir", str(tmp_path),
+    ]) == 0
+    assert (tmp_path / "smoke_result.json").is_file()
 
 
 @pytest.mark.parametrize(

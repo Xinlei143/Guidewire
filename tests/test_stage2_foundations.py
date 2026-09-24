@@ -261,13 +261,9 @@ def test_smoke_all_reports_passed_and_skipped_models(tmp_path: Path) -> None:
 
     assert main(["smoke", "--all", "--output-dir", str(tmp_path)]) == 0
     summary = json.loads((tmp_path / "smoke_summary.json").read_text())
-    assert set(summary["passed"]) == set(NEW_MODELS)
-    assert set(summary["skipped"]) == {
-        "curved-tube-2d-arc",
-        "straight-tube-mesh-3d",
-        "straight-tube-v3",
-        "straight-tube-v4",
-    }
+    from softrobot.registry import model_ids
+    assert set(summary["passed"]) == set(model_ids())
+    assert summary["skipped"] == []
     assert summary["failed"] == []
 
 

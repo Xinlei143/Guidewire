@@ -3258,6 +3258,10 @@ class BlockPentaSystem:
 
 
 def main(argv=None) -> None:
+    from .._tube_smoke import run_smoke
+    smoke_result = run_smoke(argv, "straight-tube-v4")
+    if smoke_result >= 0:
+        return smoke_result
     with cli_arguments(argv):
         parsed = parse_args()
         if parsed.self_test:
