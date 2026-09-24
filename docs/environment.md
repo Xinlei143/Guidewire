@@ -1,8 +1,10 @@
 # CPU 环境与依赖基线
 
-老师代码包的验收基线是 Linux、Python 3.10、CPU 版 PyTorch、g++ 和 Ninja；不要求
-CUDA，也没有做 CUDA 验收。`requirements-cpu.lock` 记录了本次实际验收环境中的精确
-Python 包版本，系统工具不属于 Python distributions，也不写入 lock：本次 `g++ --version` 首行是
+老师代码包的最低运行目标是 Linux、Python 3.10 和以 CPU device 运行的 PyTorch，另需 g++ 与 Ninja。
+`requirements-cpu.lock` 记录本次实际验收的 Python distributions：解释器为 Python 3.10.20；
+安装包元数据为 torch 2.11.0，而 `torch.__version__` 是 `2.11.0+cu130`，即 CUDA-enabled distribution。
+本轮所有命令均显式走 CPU 路径，没有调用 CUDA 检查，也没有验收 CUDA 或单独验收 CPU-only wheel。
+系统工具不属于 Python distributions，也不写入 lock：本次 `g++ --version` 首行是
 `g++ (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0`，`ninja --version` 输出是
 `1.13.0.git.kitware.jobserver-pipe-1`。
 

@@ -54,6 +54,16 @@ def test_lock_separates_python_distributions_from_system_tools() -> None:
     assert "g++ (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0" in environment
 
 
+def test_environment_evidence_distinguishes_distribution_from_cpu_acceptance() -> None:
+    texts = "\n".join((ROOT / path).read_text(encoding="utf-8") for path in (
+        "README.md", "docs/environment.md", "requirements-cpu.lock",
+    ))
+    for evidence in ("Python 3.10.20", "2.11.0+cu130", "CUDA-enabled distribution"):
+        assert evidence in texts
+    assert "CPU-only wheel itself was not part of this acceptance" in texts
+    assert "CUDA availability and execution were not queried or validated" in texts
+
+
 def test_documented_install_command_is_exact_and_offline_capable() -> None:
     expected = "python -m pip install --no-deps --no-build-isolation ."
     assert expected in (ROOT / "README.md").read_text(encoding="utf-8")

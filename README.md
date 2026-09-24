@@ -21,6 +21,8 @@
 最低验收基线为 Linux、Python 3.10、CPU 版 PyTorch、NumPy、SciPy、Matplotlib、
 Pillow、pytest、setuptools，以及 g++/Ninja。CUDA 不是依赖，也没有作为验收条件。
 精确验收版本与新环境命令见 `requirements-cpu.lock` 和 `docs/environment.md`。
+本次解释器是 Python 3.10.20；已安装的 `torch.__version__` 为 `2.11.0+cu130`（CUDA-enabled distribution），
+但全部验收显式使用 CPU，未调用或验收 CUDA，也未单独验证 CPU-only wheel。
 
 已有依赖时可离线安装：
 

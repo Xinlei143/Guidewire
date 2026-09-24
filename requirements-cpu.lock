@@ -1,7 +1,9 @@
-# Versions verified in the local Linux/Python 3.10 teacher-release environment.
-# PyTorch is CPU-only for this release; obtain its CPU wheel from
-# https://download.pytorch.org/whl/cpu when preparing a new online environment.
-# No CUDA runtime is required or validated.
+# Python distributions verified with CPython 3.10.20.
+# Installed torch distribution metadata is 2.11.0; torch.__version__ reports
+# 2.11.0+cu130 (a CUDA-enabled distribution). All acceptance runs explicitly
+# used device=cpu. CUDA availability and execution were not queried or validated.
+# For a new CPU-only environment, obtain the matching wheel from PyTorch official
+# CPU index; that CPU-only wheel itself was not part of this acceptance.
 numpy==2.2.6
 scipy==1.15.3
 torch==2.11.0
