@@ -70,7 +70,7 @@ def _merge_default_model_args(defaults: Sequence[str], explicit: Sequence[str]) 
 
 def _resolve_preset_resources(arguments: Sequence[str]) -> list[str]:
     replacements = {
-        "__ARC_CENTERLINE__": str(geometry_asset("arc90_L1p5m_centerline_800.csv")),
+        "__ARC_CENTERLINE__": str(geometry_asset("arc90_L1p5m_xz_centerline_800.csv")),
         "__ARC_MESH__": str(geometry_asset("arc90_L1p5m_xz_wallR60mm_protectionR50mm_64sides_axial256.obj")),
     }
     return [replacements.get(value, value) for value in arguments]
@@ -138,6 +138,41 @@ def _validate_smoke_result(result_path: Path, model_id: str) -> None:
                 raise ValueError(f"smoke_result.json variant {index} has invalid contact_count")
             if contact_count == 0 and variant["contact_force_norm"] <= 0.0:
                 raise ValueError(f"smoke_result.json variant {index} did not exercise contact")
+    contact_ki = {
+        "contact-2d-dynamic-pi": 200.0,
+        "contact-2d-quasistatic-pi-v1": 0.0,
+        "contact-2d-quasistatic-pi-v2": 400.0,
+    }
+    if model_id in contact_ki:
+        if payload.get("converged") is not True:
+            raise ValueError("smoke_result.json contact step did not converge")
+        iterations = payload.get("newton_iterations")
+        if not isinstance(iterations, int) or iterations < 1:
+            raise ValueError("smoke_result.json contact newton_iterations is invalid")
+        residual = payload.get("residual")
+        if not isinstance(residual, (int, float)) or not math.isfinite(residual) or residual < 0.0:
+            raise ValueError("smoke_result.json contact residual is invalid")
+        active_count = payload.get("active_count")
+        if not isinstance(active_count, int) or active_count < 1:
+            raise ValueError("smoke_result.json contact active_count is invalid")
+        for key in (
+            "contact_force_norm", "state_delta_norm", "integral_state_norm",
+            "integral_term_norm", "ki",
+        ):
+            value = payload.get(key)
+            if not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError(f"smoke_result.json contact {key} is invalid")
+        if payload["contact_force_norm"] <= 0.0 or payload["state_delta_norm"] <= 0.0:
+            raise ValueError("smoke_result.json contact force or state delta is not positive")
+        if payload["integral_state_norm"] <= 0.0:
+            raise ValueError("smoke_result.json contact integral_state_norm is not positive")
+        if payload["ki"] != contact_ki[model_id]:
+            raise ValueError("smoke_result.json contact ki does not match the model")
+        if contact_ki[model_id] == 0.0:
+            if payload["integral_term_norm"] != 0.0:
+                raise ValueError("smoke_result.json P-only integral_term_norm is not zero")
+        elif payload["integral_term_norm"] <= 0.0:
+            raise ValueError("smoke_result.json PI integral_term_norm is not positive")
 
 
 def _run_all_smokes(output_directory: Path) -> int:

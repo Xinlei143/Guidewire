@@ -50,12 +50,35 @@ def test_registry_covers_stage3_tube_lineage() -> None:
         assert model.task == "guidewire"
 
 
+def test_every_registry_model_has_a_unique_direct_module_entrypoint() -> None:
+    from softrobot.registry import get_model, model_ids
+
+    modules = [get_model(model_id).module for model_id in model_ids()]
+    assert len(modules) == len(set(modules)) == 19
+
+
+def test_curved_3d_registry_uses_distinct_task_entrypoints() -> None:
+    from softrobot.registry import get_model
+
+    assert get_model("curved-tube-3d-legacy-analytic").module == (
+        "softrobot.curved_tube.legacy_arc_3d_analytic"
+    )
+    assert get_model("curved-tube-3d-legacy-mesh").module == (
+        "softrobot.curved_tube.legacy_arc_3d_mesh"
+    )
+    assert get_model("curved-tube-v4-analytic").module == (
+        "softrobot.curved_tube.v4_analytic"
+    )
+    assert get_model("curved-tube-v4-mesh").module == "softrobot.curved_tube.v4_mesh"
+
+
 def test_v4_aliases_are_registry_presets() -> None:
     from softrobot.registry import get_model
 
     analytic = get_model("curved-tube-v4-analytic")
     mesh = get_model("curved-tube-v4-mesh")
-    assert analytic.module == mesh.module == "softrobot.straight_tube.v4"
+    assert analytic.module == "softrobot.curved_tube.v4_analytic"
+    assert mesh.module == "softrobot.curved_tube.v4_mesh"
     assert analytic.default_model_args == ("--contact-type", "curved-tube")
     assert mesh.default_model_args[:2] == ("--contact-type", "mesh")
     assert "--centerline-csv" in mesh.default_model_args

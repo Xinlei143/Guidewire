@@ -52,10 +52,15 @@ softrobot smoke --all --output-dir /tmp/softrobot-smoke
 ```bash
 python -m softrobot.straight_tube.v4 --smoke-test --output-dir /tmp/v4
 python -m softrobot.curved_tube.arc_2d --smoke-test --output-dir /tmp/arc2d
+python -m softrobot.curved_tube.legacy_arc_3d_analytic --smoke-test --output-dir /tmp/legacy-arc-analytic
+python -m softrobot.curved_tube.legacy_arc_3d_mesh --smoke-test --output-dir /tmp/legacy-arc-mesh
+python -m softrobot.curved_tube.v4_analytic --smoke-test --output-dir /tmp/v4-arc-analytic
+python -m softrobot.curved_tube.v4_mesh --smoke-test --output-dir /tmp/v4-arc-mesh
 python -m softrobot.foundations.implicit_newton_3d --smoke-test --output-dir /tmp/newton3d
 ```
 
-不带 `--smoke-test` 时保留历史模型原有默认参数和算例语义。smoke 模式才会缩小节点
+registry 中 19 个 Model ID 各自对应唯一模块入口。曲管 analytic/mesh 模块各自预置正确
+接触类型和规范资产；用户显式提供的同名长选项会覆盖预置。不带 `--smoke-test` 时保留历史模型原有默认参数和算例语义。smoke 模式才会缩小节点
 数、步数和输出规模，并固定为 CPU、Matplotlib Agg 无头后端和确定性随机种子。
 
 ## 3. 模型状态与 smoke 覆盖

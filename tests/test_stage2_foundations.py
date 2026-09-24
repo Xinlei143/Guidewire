@@ -216,6 +216,27 @@ def test_each_stage_two_module_runs_a_real_smoke(
         assert payload["newton_iterations"] >= 1
         assert payload["residual"] >= 0.0
         assert payload["residual_norm"] == payload["residual"]
+        assert payload["active_count"] > 0
+        assert payload["contact_force_norm"] > 0.0
+        assert payload["state_delta_norm"] > 0.0
+        assert payload["integral_state_norm"] > 0.0
+        expected_ki = {
+            "contact-2d-dynamic-pi": 200.0,
+            "contact-2d-quasistatic-pi-v1": 0.0,
+            "contact-2d-quasistatic-pi-v2": 400.0,
+        }[model_id]
+        assert payload["ki"] == expected_ki
+        if expected_ki == 0.0:
+            assert payload["integral_term_norm"] == 0.0
+        else:
+            assert payload["integral_term_norm"] > 0.0
+        assert len(payload["variants"]) == 1
+        variant = payload["variants"][0]
+        assert variant["iterations"] == payload["newton_iterations"]
+        assert variant["residual"] == payload["residual"]
+        assert variant["contact_count"] == payload["active_count"]
+        assert variant["contact_force_norm"] == payload["contact_force_norm"]
+        assert variant["state_delta_norm"] == payload["state_delta_norm"]
 
 
 def test_contact_smoke_rejects_an_unconverged_step(
@@ -240,6 +261,110 @@ def test_contact_smoke_rejects_an_unconverged_step(
             dynamic_pi_2d, "contact-2d-dynamic-pi", tmp_path, quasistatic=False
         )
     assert not (tmp_path / "smoke_result.json").exists()
+
+
+def test_contact_smoke_rejects_nonfinite_measured_force(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import numpy as np
+    from softrobot.contact import dynamic_pi_2d
+    from softrobot.contact._smoke import run_contact_smoke
+
+    original_step = dynamic_pi_2d.implicit_euler_step
+
+    def nonfinite_force_step(*args, **kwargs):
+        result = list(original_step(*args, **kwargs))
+        result[3] = result[3].copy()
+        result[3][0, 1] = np.nan
+        return tuple(result)
+
+    monkeypatch.setattr(dynamic_pi_2d, "implicit_euler_step", nonfinite_force_step)
+    with pytest.raises(RuntimeError, match="non-finite evidence"):
+        run_contact_smoke(
+            dynamic_pi_2d, "contact-2d-dynamic-pi", tmp_path, quasistatic=False,
+        )
+    assert not (tmp_path / "smoke_result.json").exists()
+
+
+def test_cli_rejects_contact_artifact_without_required_integral_evidence(
+    tmp_path: Path,
+) -> None:
+    from softrobot.cli import _validate_smoke_result
+
+    result_path = tmp_path / "smoke_result.json"
+    result_path.write_text(json.dumps({
+        "model_id": "contact-2d-quasistatic-pi-v2",
+        "status": "passed",
+        "finite": True,
+        "converged": True,
+        "newton_iterations": 1,
+        "residual": 0.0,
+        "active_count": 1,
+        "contact_force_norm": 1.0,
+        "state_delta_norm": 1.0,
+        "ki": 400.0,
+        "integral_state_norm": 0.0,
+        "integral_term_norm": 0.0,
+        "variants": [{
+            "finite": True, "converged": True, "iterations": 1,
+            "residual": 0.0, "state_delta_norm": 1.0,
+            "contact_force_norm": 1.0, "contact_count": 1,
+        }],
+    }), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="integral_state_norm"):
+        _validate_smoke_result(result_path, "contact-2d-quasistatic-pi-v2")
+
+
+@pytest.mark.parametrize(
+    "module_name",
+    (
+        "softrobot.contact.dynamic_pi_2d",
+        "softrobot.contact.quasistatic_pi_v1",
+        "softrobot.contact.quasistatic_pi_v2",
+    ),
+)
+def test_contact_smoke_calls_each_production_implicit_step(
+    module_name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = __import__(module_name, fromlist=["unused"])
+    from softrobot.contact._smoke import run_contact_smoke
+
+    def implicit_probe(*args, **kwargs):
+        raise RuntimeError("contact-implicit-probe")
+
+    monkeypatch.setattr(module, "implicit_euler_step", implicit_probe)
+    with pytest.raises(RuntimeError, match="contact-implicit-probe"):
+        run_contact_smoke(
+            module, "probe", tmp_path,
+            quasistatic=module_name != "softrobot.contact.dynamic_pi_2d",
+        )
+
+
+@pytest.mark.parametrize(
+    ("module_name", "function_name"),
+    (
+        ("softrobot.contact.dynamic_pi_2d", "compute_PI_contact_force"),
+        ("softrobot.contact.quasistatic_pi_v1", "compute_PI_contact_force"),
+        ("softrobot.contact.quasistatic_pi_v2", "_contact_quantities_torch"),
+    ),
+)
+def test_contact_smoke_calls_each_production_contact_function(
+    module_name: str, function_name: str, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = __import__(module_name, fromlist=["unused"])
+    from softrobot.contact._smoke import run_contact_smoke
+
+    def contact_probe(*args, **kwargs):
+        raise RuntimeError("contact-force-probe")
+
+    monkeypatch.setattr(module, function_name, contact_probe)
+    with pytest.raises(RuntimeError, match="contact-force-probe"):
+        run_contact_smoke(
+            module, "probe", tmp_path,
+            quasistatic=module_name != "softrobot.contact.dynamic_pi_2d",
+        )
 
 
 def test_cli_runs_registered_stage_two_model(tmp_path: Path) -> None:
