@@ -872,7 +872,7 @@ def parse_args(argv: list[str] | None = None):
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.smoke_test:
-        from softrobot._smoke import configure_cpu_runtime, write_smoke_result
+        from .._smoke import configure_cpu_runtime, write_smoke_result
 
         configure_cpu_runtime()
         args.num_segments = 3

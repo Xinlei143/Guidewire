@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import os
 from pathlib import Path
@@ -27,6 +28,31 @@ def _environment() -> dict[str, str]:
     environment["PYTHONPATH"] = str(ROOT / "src")
     environment["MPLBACKEND"] = "Agg"
     return environment
+
+
+def test_package_modules_use_relative_internal_imports() -> None:
+    violations: list[str] = []
+    for path in (ROOT / "src/softrobot").rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8-sig"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                if node.level == 0 and node.module == "softrobot._smoke":
+                    violations.append(f"{path.relative_to(ROOT)}:{node.lineno}:{node.module}")
+
+    assert violations == []
+
+
+def test_quasistatic_registry_sources_use_complete_sha256() -> None:
+    from softrobot.registry import get_model
+
+    assert get_model("contact-2d-quasistatic-pi-v1").source == (
+        "SoftRobot.zip root untracked SHA256 "
+        "1a0b234ef0693053d2296a99e5b023888c31fe6f913d099f6b551610a40a894b"
+    )
+    assert get_model("contact-2d-quasistatic-pi-v2").source == (
+        "SoftRobot.zip root untracked SHA256 "
+        "baa0c14e3b9b12bd93b14b0def26c03006b494b4eed61f5f69cb5398945d76cf"
+    )
 
 
 def test_smoke_runtime_does_not_mutate_cuda_visibility(

@@ -176,7 +176,7 @@ def visualize(recorded_positions):
     plt.show()
 
 def _run_smoke(output_dir: str) -> None:
-    from softrobot._smoke import configure_cpu_runtime, write_smoke_result
+    from .._smoke import configure_cpu_runtime, write_smoke_result
 
     configure_cpu_runtime()
     smoke_nodes = 4

@@ -133,7 +133,7 @@ def print_summary(result: SimulationResult, max_steps: int) -> None:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.smoke_test:
-        from softrobot._smoke import configure_cpu_runtime
+        from ..._smoke import configure_cpu_runtime
 
         configure_cpu_runtime()
         args.num_links = 3
@@ -184,7 +184,7 @@ def main(argv: list[str] | None = None) -> int:
     print_displacements(initial_positions, result.final_positions, force_node)
 
     if args.smoke_test:
-        from softrobot._smoke import write_smoke_result
+        from ..._smoke import write_smoke_result
 
         write_smoke_result(
             args.output_dir, "foundation-cantilever-der",

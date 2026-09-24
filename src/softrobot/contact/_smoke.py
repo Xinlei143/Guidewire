@@ -7,7 +7,7 @@ from types import ModuleType
 
 import numpy as np
 
-from softrobot._smoke import configure_cpu_runtime, write_smoke_result
+from .._smoke import configure_cpu_runtime, write_smoke_result
 
 
 def run_contact_smoke(

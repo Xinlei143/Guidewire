@@ -577,7 +577,7 @@ def print_displacements(initial_positions, final_positions, force_node):
 
 
 def _run_smoke(output_dir: str) -> None:
-    from softrobot._smoke import configure_cpu_runtime, write_smoke_result
+    from .._smoke import configure_cpu_runtime, write_smoke_result
 
     configure_cpu_runtime()
     positions, rest_lengths, node_masses = initialize_rod(

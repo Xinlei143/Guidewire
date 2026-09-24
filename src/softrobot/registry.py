@@ -38,13 +38,13 @@ _MODELS = {
             "contact-2d-quasistatic-pi-v1", "softrobot.contact.quasistatic_pi_v1", True,
             task="contact", status="historical", dimension="2d",
             geometry="parallel-walls", contact="pi-soft-wall",
-            source="SoftRobot.zip root untracked SHA256 1a0b234e...",
+            source="SoftRobot.zip root untracked SHA256 1a0b234ef0693053d2296a99e5b023888c31fe6f913d099f6b551610a40a894b",
         ),
         ModelSpec(
             "contact-2d-quasistatic-pi-v2", "softrobot.contact.quasistatic_pi_v2", True,
             task="contact", status="historical", dimension="2d",
             geometry="parallel-walls", contact="pi-soft-wall",
-            source="SoftRobot.zip root untracked SHA256 baa0c14e...",
+            source="SoftRobot.zip root untracked SHA256 baa0c14e3b9b12bd93b14b0def26c03006b494b4eed61f5f69cb5398945d76cf",
         ),
         ModelSpec("curved-tube-2d-arc", "softrobot.curved_tube.arc_2d", dimension="2d", geometry="curved", contact="pi-soft-wall"),
         ModelSpec(
