@@ -27,8 +27,12 @@ from softrobot.foundations.cantilever.eb_beam_validation import (
 )
 
 
-def _relative_error(measured: float, reference: float) -> float | None:
-    return abs(measured - reference) / abs(reference) if reference != 0.0 else None
+def _transverse_relative_error(measured: np.ndarray, reference: np.ndarray) -> float | None:
+    denominator = float(np.linalg.norm(reference[1:3]))
+    if denominator == 0.0:
+        return None
+    numerator = float(np.linalg.norm(measured[1:3] - reference[1:3]))
+    return numerator / denominator
 
 
 def run_validation(
@@ -50,8 +54,10 @@ def run_validation(
     """
     if num_links < 2 or total_length <= 0 or EA <= 0 or B <= 0:
         raise ValueError("Require >=2 links and positive length, EA, and B.")
-    if residual_tolerance <= 0 or max_iterations < 1:
-        raise ValueError("Require positive residual tolerance and max iterations.")
+    if not math.isfinite(residual_tolerance) or residual_tolerance <= 0:
+        raise ValueError("Require a finite positive residual tolerance.")
+    if max_iterations < 1:
+        raise ValueError("Require positive max iterations.")
     if not all(math.isfinite(v) for v in (*force_vector, total_length, EA, B)):
         raise ValueError("All physical inputs must be finite.")
     num_nodes = num_links + 1
@@ -108,13 +114,16 @@ def run_validation(
     reference = None
     if eb is not None:
         eb_disp = (eb - initial).numpy()
+        force_error = _transverse_relative_error(displacement[force_node], eb_disp[force_node])
+        tip_error = _transverse_relative_error(displacement[-1], eb_disp[-1])
         reference = {
+            "comparison_quantity": "transverse_yz_displacement_vector",
+            "relative_error_status": ("defined" if force_error is not None and tip_error is not None
+                                      else "undefined_zero_reference"),
             "force_node_displacement_m": eb_disp[force_node].tolist(),
             "tip_displacement_m": eb_disp[-1].tolist(),
-            "force_node_relative_error": _relative_error(
-                force_disp[2], float(eb_disp[force_node, 2])),
-            "tip_relative_error": _relative_error(
-                tip_disp[2], float(eb_disp[-1, 2])),
+            "force_node_relative_error": force_error,
+            "tip_relative_error": tip_error,
         }
 
     report = {
