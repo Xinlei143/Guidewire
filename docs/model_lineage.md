@@ -26,7 +26,7 @@ The distinct torsion prototype `soft_robot_chain_bending_stretching_torsion.py` 
 | `contact-2d-quasistatic-pi-v1` | attachment root `rod_soft_contact_PI_dynamic_quasi_static.py` | untracked attachment file SHA256 `1a0b234ef0693053d2296a99e5b023888c31fe6f913d099f6b551610a40a894b` | Retained separately: pure-proportional `KI=0` branch; smoke records updated integral state and the definitionally zero integral-force term |
 | `contact-2d-quasistatic-pi-v2` | attachment root `rod_soft_contact_PI_dynamic_quasi_static_v2.py` | untracked attachment file SHA256 `baa0c14e3b9b12bd93b14b0def26c03006b494b4eed61f5f69cb5398945d76cf` | Retained separately: `KI=400`; smoke records positive integral state/force contribution and real active contact, so it is not a content duplicate of v1 |
 
-Excluded from import: attachment `.git`, caches, `.DS_Store`, DOCX, MATLAB, NPZ, media, and all generated outputs.
+Excluded from the attachment working-tree import: `.git`, caches, `.DS_Store`, DOCX, other MATLAB scripts (including the suspected third-party `untitled.m`), NPZ, media, and all generated outputs. The sole retained matched-parameter MATLAB comparison was restored from the local Git ancestor, as recorded above.
 
 ## Straight and curved tube lineage
 

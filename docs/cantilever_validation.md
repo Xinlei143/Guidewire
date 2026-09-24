@@ -54,3 +54,5 @@ matlab -batch "set(0,'DefaultFigureVisible','off'); addpath('validation/cosserat
 | MATLAB Cosserat | -0.115692363 | 0.437051073 | MATLAB `fsolve` 输出 |
 
 按 MATLAB 分量绝对值为分母，`ux` 差 3.777%，`uz` 差 2.737%；`(ux,uz)` 向量差相对于 MATLAB 向量范数为 2.817%。Cosserat 脚本包含高刚度剪切/扭转惩罚，而 DER 模型不包含剪切/扭转自由度；边界离散和静态求解形式也不同。这是参数匹配的单算例数值对照，不表示两种杆理论等价，也不足以宣称模型已全面验证。
+
+该历史 MATLAB 脚本调用 `fsolve`，但未记录 `exitflag` 或末端边界残差；因此上表数值仅作单算例对照，不能把它视为经求解状态审计的基准。脚本源码保持历史原字节，若需进一步验证应另行记录求解状态和边界残差。
