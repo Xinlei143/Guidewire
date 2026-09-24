@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
-import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import time
 from collections.abc import Iterator, Sequence
 
+from ._smoke import write_json_atomic
 from .registry import get_model, model_ids
 
 
@@ -65,6 +66,13 @@ def _parsers() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
 def _run_all_smokes(output_directory: Path) -> int:
     output_directory.mkdir(parents=True, exist_ok=True)
     summary: dict[str, list] = {"passed": [], "skipped": [], "failed": []}
+    source_root = str(Path(__file__).resolve().parents[1])
+    environment = os.environ.copy()
+    existing_pythonpath = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = (
+        source_root if not existing_pythonpath
+        else source_root + os.pathsep + existing_pythonpath
+    )
     for model_id in model_ids():
         model = get_model(model_id)
         if not model.smoke_test:
@@ -72,23 +80,34 @@ def _run_all_smokes(output_directory: Path) -> int:
             print(f"SKIPPED {model_id}: common smoke contract not implemented yet")
             continue
         model_output = output_directory / model_id
+        model_output.mkdir(parents=True, exist_ok=True)
+        result_path = model_output / "smoke_result.json"
+        result_path.unlink(missing_ok=True)
+        command = [
+            sys.executable, "-m", "softrobot.cli", "run", model_id,
+            "--smoke-test", "--output-dir", str(model_output),
+        ]
         started = time.perf_counter()
         try:
-            result = model.load_main()(["--smoke-test", "--output-dir", str(model_output)])
-            if result not in (None, 0):
-                raise RuntimeError(f"returned {result}")
-        except BaseException as error:
-            if isinstance(error, KeyboardInterrupt):
-                raise
+            result = subprocess.run(
+                command, capture_output=True, text=True, env=environment,
+            )
+        except Exception as error:
+            result_path.unlink(missing_ok=True)
             summary["failed"].append({"model_id": model_id, "error": str(error)})
+            print(f"FAILED {model_id}: {error}")
+            continue
+        if result.returncode != 0:
+            result_path.unlink(missing_ok=True)
+            detail = result.stderr.strip() or result.stdout.strip() or "no child output"
+            error = f"exit code {result.returncode}: {detail}"
+            summary["failed"].append({"model_id": model_id, "error": error})
             print(f"FAILED {model_id}: {error}")
         else:
             elapsed = time.perf_counter() - started
             summary["passed"].append(model_id)
             print(f"PASSED {model_id} ({elapsed:.3f}s)")
-    (output_directory / "smoke_summary.json").write_text(
-        json.dumps(summary, indent=2, sort_keys=True) + "\n"
-    )
+    write_json_atomic(output_directory / "smoke_summary.json", summary)
     return 1 if summary["failed"] else 0
 
 

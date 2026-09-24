@@ -7,9 +7,10 @@ from types import ModuleType
 
 import numpy as np
 
-from .._smoke import configure_cpu_runtime, write_smoke_result
+from .._smoke import cpu_smoke_runtime, write_smoke_result
 
 
+@cpu_smoke_runtime()
 def run_contact_smoke(
     module: ModuleType,
     model_id: str,
@@ -18,7 +19,6 @@ def run_contact_smoke(
     quasistatic: bool,
 ) -> None:
     """Evaluate one genuine implicit-Euler/Newton residual step on CPU."""
-    configure_cpu_runtime()
     if quasistatic:
         state = module.initialize_rod(
             module.TOTAL_LENGTH, 6, module.DIAMETER, module.MATERIAL_DENSITY, 0.0
@@ -63,11 +63,18 @@ def run_contact_smoke(
     )
     new_positions = result[0]
     info = result[-1]
+    if not info.converged:
+        raise RuntimeError(
+            f"{model_id} implicit smoke step did not converge: "
+            f"residual={info.residual_norm:.6e}"
+        )
     write_smoke_result(
         output_dir,
         model_id,
         new_positions,
         steps=1,
+        converged=bool(info.converged),
         newton_iterations=int(info.iterations),
+        residual=float(info.residual_norm),
         residual_norm=float(info.residual_norm),
     )

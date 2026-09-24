@@ -176,9 +176,13 @@ def visualize(recorded_positions):
     plt.show()
 
 def _run_smoke(output_dir: str) -> None:
-    from .._smoke import configure_cpu_runtime, write_smoke_result
+    from .._smoke import cpu_smoke_runtime, write_smoke_result
 
-    configure_cpu_runtime()
+    with cpu_smoke_runtime():
+        _run_smoke_in_runtime(output_dir, write_smoke_result)
+
+
+def _run_smoke_in_runtime(output_dir: str, write_smoke_result) -> None:
     smoke_nodes = 4
     smoke_segments = 4
     smoke_positions = np.column_stack(

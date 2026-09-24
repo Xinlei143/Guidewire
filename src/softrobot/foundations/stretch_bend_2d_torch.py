@@ -451,9 +451,13 @@ def print_displacements(initial_positions, final_positions, force_node):
 # ==================== 主程序 ====================
 
 def _run_smoke(output_dir: str) -> None:
-    from .._smoke import configure_cpu_runtime, write_smoke_result
+    from .._smoke import cpu_smoke_runtime, write_smoke_result
 
-    configure_cpu_runtime()
+    with cpu_smoke_runtime():
+        _run_smoke_in_runtime(output_dir, write_smoke_result)
+
+
+def _run_smoke_in_runtime(output_dir: str, write_smoke_result) -> None:
     positions, rest_lengths, node_masses = initialize_rod(0.4, 4, node_mass)
     force_func, _ = create_force_function("constant", 0.1, [1.0, 0.0])
     history = run_simulation(

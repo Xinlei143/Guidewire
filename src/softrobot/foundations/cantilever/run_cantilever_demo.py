@@ -133,9 +133,15 @@ def print_summary(result: SimulationResult, max_steps: int) -> None:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.smoke_test:
-        from ..._smoke import configure_cpu_runtime
+        from ..._smoke import cpu_smoke_runtime
 
-        configure_cpu_runtime()
+        with cpu_smoke_runtime():
+            return _run(args)
+    return _run(args)
+
+
+def _run(args: argparse.Namespace) -> int:
+    if args.smoke_test:
         args.num_links = 3
         args.steps = 2
         args.save_every = 1

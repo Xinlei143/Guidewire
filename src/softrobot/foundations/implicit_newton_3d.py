@@ -872,33 +872,36 @@ def parse_args(argv: list[str] | None = None):
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.smoke_test:
-        from .._smoke import configure_cpu_runtime, write_smoke_result
+        from .._smoke import cpu_smoke_runtime, write_smoke_result
 
-        configure_cpu_runtime()
-        args.num_segments = 3
-        args.total_length = 0.3
-        args.mass_mode = "node"
-        args.node_mass = 0.1
-        args.dt = 1.0e-3
-        args.total_time = 1.0e-3
-        args.gravity = 0.0
-        args.force_magnitude = 0.01
-        args.force_node = args.num_segments
-        args.save_every = 1
-        args.max_newton_iters = 5
-        args.show_final = False
-        args.show_history = False
-        args.save_npz = None
-        history = run_implicit_simulation(args)
-        write_smoke_result(
-            args.output_dir, "foundation-3d-implicit-newton",
-            history["positions"][-1], steps=1,
-            newton_iterations=int(history["newton_iterations"][-1]),
-        )
-        return 0
+        with cpu_smoke_runtime():
+            return _run_smoke(args, write_smoke_result)
     run_implicit_simulation(args)
     return 0
 
+
+def _run_smoke(args, write_smoke_result) -> int:
+    args.num_segments = 3
+    args.total_length = 0.3
+    args.mass_mode = "node"
+    args.node_mass = 0.1
+    args.dt = 1.0e-3
+    args.total_time = 1.0e-3
+    args.gravity = 0.0
+    args.force_magnitude = 0.01
+    args.force_node = args.num_segments
+    args.save_every = 1
+    args.max_newton_iters = 5
+    args.show_final = False
+    args.show_history = False
+    args.save_npz = None
+    history = run_implicit_simulation(args)
+    write_smoke_result(
+        args.output_dir, "foundation-3d-implicit-newton",
+        history["positions"][-1], steps=1,
+        newton_iterations=int(history["newton_iterations"][-1]),
+    )
+    return 0
 
 if __name__ == "__main__":
     raise SystemExit(main())

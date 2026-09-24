@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -55,15 +56,71 @@ def test_quasistatic_registry_sources_use_complete_sha256() -> None:
     )
 
 
-def test_smoke_runtime_does_not_mutate_cuda_visibility(
+def test_cpu_smoke_runtime_restores_process_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from softrobot._smoke import configure_cpu_runtime
+    import matplotlib
+    import numpy as np
+    import torch
+    from softrobot import _smoke
 
+    assert hasattr(_smoke, "cpu_smoke_runtime")
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "existing-selection")
-    configure_cpu_runtime()
+    np.random.seed(314159)
+    torch.manual_seed(271828)
+    numpy_before = np.random.get_state()
+    torch_before = torch.random.get_rng_state().clone()
+    device_before = torch.get_default_device()
+    backend_before = matplotlib.get_backend()
 
+    with _smoke.cpu_smoke_runtime():
+        assert os.environ["CUDA_VISIBLE_DEVICES"] == ""
+        assert torch.get_default_device() == torch.device("cpu")
+        assert matplotlib.get_backend().lower() == "agg"
+        np.random.random()
+        torch.rand(1)
+
+    numpy_after = np.random.get_state()
+    assert numpy_after[0] == numpy_before[0]
+    assert np.array_equal(numpy_after[1], numpy_before[1])
+    assert numpy_after[2:] == numpy_before[2:]
+    assert torch.equal(torch.random.get_rng_state(), torch_before)
+    assert torch.get_default_device() == device_before
+    assert matplotlib.get_backend() == backend_before
     assert os.environ["CUDA_VISIBLE_DEVICES"] == "existing-selection"
+
+
+def test_atomic_json_replaces_complete_document(tmp_path: Path) -> None:
+    from softrobot import _smoke
+
+    assert hasattr(_smoke, "write_json_atomic")
+    destination = tmp_path / "result.json"
+    destination.write_text('{"old": true}\n')
+
+    _smoke.write_json_atomic(destination, {"new": True})
+
+    assert json.loads(destination.read_text()) == {"new": True}
+    assert list(tmp_path.glob(".result.json.*.tmp")) == []
+
+
+def test_atomic_json_preserves_old_document_and_cleans_temp_on_replace_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from softrobot import _smoke
+
+    assert hasattr(_smoke, "write_json_atomic")
+    destination = tmp_path / "result.json"
+    destination.write_text('{"old": true}\n')
+
+    def fail_replace(_source, _destination):
+        raise OSError("interrupted replace")
+
+    monkeypatch.setattr(_smoke.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="interrupted replace"):
+        _smoke.write_json_atomic(destination, {"new": True})
+
+    assert json.loads(destination.read_text()) == {"old": True}
+    assert list(tmp_path.glob(".result.json.*.tmp")) == []
 
 
 def test_registry_exposes_stage_two_metadata() -> None:
@@ -149,6 +206,35 @@ def test_each_stage_two_module_runs_a_real_smoke(
     assert payload["finite"] is True
     assert payload["steps"] >= 1
     assert len(payload["state_shape"]) == 2
+    if model_id.startswith("contact-"):
+        assert payload["converged"] is True
+        assert payload["newton_iterations"] >= 1
+        assert payload["residual"] >= 0.0
+        assert payload["residual_norm"] == payload["residual"]
+
+
+def test_contact_smoke_rejects_an_unconverged_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from softrobot.contact import dynamic_pi_2d
+    from softrobot.contact._smoke import run_contact_smoke
+
+    original_step = dynamic_pi_2d.implicit_euler_step
+
+    def unconverged_step(*args, **kwargs):
+        result = list(original_step(*args, **kwargs))
+        result[-1] = SimpleNamespace(
+            converged=False, iterations=2, residual_norm=1.0,
+            step_norm=1.0, line_search_failures=1,
+        )
+        return tuple(result)
+
+    monkeypatch.setattr(dynamic_pi_2d, "implicit_euler_step", unconverged_step)
+    with pytest.raises(RuntimeError, match="did not converge"):
+        run_contact_smoke(
+            dynamic_pi_2d, "contact-2d-dynamic-pi", tmp_path, quasistatic=False
+        )
+    assert not (tmp_path / "smoke_result.json").exists()
 
 
 def test_cli_runs_registered_stage_two_model(tmp_path: Path) -> None:
@@ -180,33 +266,78 @@ def test_smoke_all_reports_passed_and_skipped_models(tmp_path: Path) -> None:
     assert summary["failed"] == []
 
 
-def test_smoke_all_returns_nonzero_and_records_a_model_failure(
+def test_smoke_all_uses_cli_run_subprocess_contract(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from softrobot import cli
     from softrobot.registry import ModelSpec
 
-    class BrokenSpec(ModelSpec):
-        def load_main(self):
-            def fail(_arguments):
-                raise RuntimeError("intentional smoke failure")
-            return fail
+    model = ModelSpec("isolated-model", "unused", smoke_test=True)
+    calls: list[list[str]] = []
 
-    broken = BrokenSpec(
-        "broken-model", "unused", smoke_test=True, task="foundation",
-        status="historical", dimension="2d", geometry="straight",
-        contact="none", backend="numpy", source="test fixture",
-    )
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(cli, "model_ids", lambda: ("isolated-model",))
+    monkeypatch.setattr(cli, "get_model", lambda _model_id: model)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert cli._run_all_smokes(tmp_path) == 0
+    assert calls == [[
+        sys.executable, "-m", "softrobot.cli", "run", "isolated-model",
+        "--smoke-test", "--output-dir", str(tmp_path / "isolated-model"),
+    ]]
+
+
+def test_smoke_all_removes_stale_passed_artifact_when_child_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from softrobot import cli
+    from softrobot.registry import ModelSpec
+
+    model = ModelSpec("broken-model", "unused", smoke_test=True)
+    stale = tmp_path / "broken-model" / "smoke_result.json"
+    stale.parent.mkdir(parents=True)
+    stale.write_text('{"status": "passed"}\n')
+
+    def fake_run(command, **kwargs):
+        return subprocess.CompletedProcess(
+            command, 7, stdout="", stderr="forced child failure\n"
+        )
+
     monkeypatch.setattr(cli, "model_ids", lambda: ("broken-model",))
-    monkeypatch.setattr(cli, "get_model", lambda _model_id: broken)
+    monkeypatch.setattr(cli, "get_model", lambda _model_id: model)
+    monkeypatch.setattr(subprocess, "run", fake_run)
 
     assert cli._run_all_smokes(tmp_path) == 1
+    assert not stale.exists()
     summary = json.loads((tmp_path / "smoke_summary.json").read_text())
     assert summary["passed"] == []
     assert summary["skipped"] == []
     assert summary["failed"] == [
-        {"model_id": "broken-model", "error": "intentional smoke failure"}
+        {"model_id": "broken-model", "error": "exit code 7: forced child failure"}
     ]
+
+
+@pytest.mark.parametrize("terminal_error", (KeyboardInterrupt, GeneratorExit))
+def test_smoke_all_does_not_swallow_process_terminal_exceptions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, terminal_error: type[BaseException]
+) -> None:
+    from softrobot import cli
+    from softrobot.registry import ModelSpec
+
+    model = ModelSpec("terminal-model", "unused", smoke_test=True)
+
+    def fake_run(command, **kwargs):
+        raise terminal_error()
+
+    monkeypatch.setattr(cli, "model_ids", lambda: ("terminal-model",))
+    monkeypatch.setattr(cli, "get_model", lambda _model_id: model)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(terminal_error):
+        cli._run_all_smokes(tmp_path)
 
 
 def test_stage_two_source_tree_contains_no_source_junk() -> None:
