@@ -73,6 +73,11 @@ def test_cpu_smoke_runtime_restores_process_state(
     device_before = torch.get_default_device()
     backend_before = matplotlib.get_backend()
 
+    def forbidden_seed(*_args, **_kwargs):
+        raise AssertionError("torch.manual_seed must not seed all devices")
+
+    monkeypatch.setattr(torch, "manual_seed", forbidden_seed)
+
     with _smoke.cpu_smoke_runtime():
         assert os.environ["CUDA_VISIBLE_DEVICES"] == ""
         assert torch.get_default_device() == torch.device("cpu")
@@ -272,11 +277,16 @@ def test_smoke_all_uses_cli_run_subprocess_contract(
     from softrobot import cli
     from softrobot.registry import ModelSpec
 
-    model = ModelSpec("isolated-model", "unused", smoke_test=True)
-    calls: list[list[str]] = []
+    model = ModelSpec("isolated-model", "unused", smoke_test=True, timeout_s=7.5)
+    calls: list[tuple[list[str], dict]] = []
 
     def fake_run(command, **kwargs):
-        calls.append(command)
+        calls.append((command, kwargs))
+        output_dir = Path(command[-1])
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "smoke_result.json").write_text(json.dumps({
+            "model_id": "isolated-model", "status": "passed", "finite": True,
+        }))
         return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
     monkeypatch.setattr(cli, "model_ids", lambda: ("isolated-model",))
@@ -284,10 +294,120 @@ def test_smoke_all_uses_cli_run_subprocess_contract(
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     assert cli._run_all_smokes(tmp_path) == 0
-    assert calls == [[
+    assert calls[0][0] == [
         sys.executable, "-m", "softrobot.cli", "run", "isolated-model",
         "--smoke-test", "--output-dir", str(tmp_path / "isolated-model"),
-    ]]
+    ]
+    assert calls[0][1]["timeout"] == 7.5
+
+
+def test_smoke_timeout_defaults_to_sixty_seconds() -> None:
+    from softrobot.registry import ModelSpec
+
+    assert ModelSpec("model", "module").timeout_s == 60.0
+
+
+def test_smoke_all_rejects_zero_exit_without_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from softrobot import cli
+    from softrobot.registry import ModelSpec
+
+    model = ModelSpec("missing-result", "unused", smoke_test=True)
+    monkeypatch.setattr(cli, "model_ids", lambda: (model.model_id,))
+    monkeypatch.setattr(cli, "get_model", lambda _model_id: model)
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(command, 0, "", ""),
+    )
+
+    assert cli._run_all_smokes(tmp_path) == 1
+    summary = json.loads((tmp_path / "smoke_summary.json").read_text())
+    assert summary["failed"] == [{
+        "model_id": model.model_id, "error": "missing smoke_result.json",
+    }]
+
+
+def test_smoke_all_rejects_malformed_json_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from softrobot import cli
+    from softrobot.registry import ModelSpec
+
+    model = ModelSpec("malformed-result", "unused", smoke_test=True)
+
+    def fake_run(command, **kwargs):
+        result_path = Path(command[-1]) / "smoke_result.json"
+        result_path.write_text("{not-json")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(cli, "model_ids", lambda: (model.model_id,))
+    monkeypatch.setattr(cli, "get_model", lambda _model_id: model)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert cli._run_all_smokes(tmp_path) == 1
+    summary = json.loads((tmp_path / "smoke_summary.json").read_text())
+    assert "invalid smoke_result.json" in summary["failed"][0]["error"]
+
+
+@pytest.mark.parametrize(("payload", "error_text"), (
+    ({"model_id": "other", "status": "passed", "finite": True}, "model_id mismatch"),
+    ({"model_id": "mismatch-result", "status": "failed", "finite": True}, "status is not 'passed'"),
+    ({"model_id": "mismatch-result", "status": "passed", "finite": 1}, "finite is not true"),
+))
+def test_smoke_all_rejects_mismatched_result_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, payload: dict, error_text: str
+) -> None:
+    from softrobot import cli
+    from softrobot.registry import ModelSpec
+
+    model = ModelSpec("mismatch-result", "unused", smoke_test=True)
+
+    def fake_run(command, **kwargs):
+        result_path = Path(command[-1]) / "smoke_result.json"
+        result_path.write_text(json.dumps(payload))
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(cli, "model_ids", lambda: (model.model_id,))
+    monkeypatch.setattr(cli, "get_model", lambda _model_id: model)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert cli._run_all_smokes(tmp_path) == 1
+    summary = json.loads((tmp_path / "smoke_summary.json").read_text())
+    assert error_text in summary["failed"][0]["error"]
+
+
+def test_smoke_all_records_timeout_and_continues(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from softrobot import cli
+    from softrobot.registry import ModelSpec
+
+    timed_out = ModelSpec("timed-out", "unused", smoke_test=True, timeout_s=0.25)
+    completed = ModelSpec("completed", "unused", smoke_test=True)
+
+    def fake_run(command, **kwargs):
+        model_id = command[4]
+        if model_id == timed_out.model_id:
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+        result_path = Path(command[-1]) / "smoke_result.json"
+        result_path.write_text(json.dumps({
+            "model_id": completed.model_id, "status": "passed", "finite": True,
+        }))
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    models = {model.model_id: model for model in (timed_out, completed)}
+    monkeypatch.setattr(cli, "model_ids", lambda: tuple(models))
+    monkeypatch.setattr(cli, "get_model", models.__getitem__)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert cli._run_all_smokes(tmp_path) == 1
+    summary = json.loads((tmp_path / "smoke_summary.json").read_text())
+    assert summary["passed"] == [completed.model_id]
+    assert summary["failed"] == [{
+        "model_id": timed_out.model_id,
+        "error": "timed out after 0.25 seconds",
+    }]
 
 
 def test_smoke_all_removes_stale_passed_artifact_when_child_fails(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -63,6 +64,26 @@ def _parsers() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
     return parser, run
 
 
+def _validate_smoke_result(result_path: Path, model_id: str) -> None:
+    if not result_path.is_file():
+        raise ValueError("missing smoke_result.json")
+    try:
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"invalid smoke_result.json: {error}") from error
+    if not isinstance(payload, dict):
+        raise ValueError("invalid smoke_result.json: root must be an object")
+    if payload.get("model_id") != model_id:
+        raise ValueError(
+            f"smoke_result.json model_id mismatch: expected {model_id!r}, "
+            f"got {payload.get('model_id')!r}"
+        )
+    if payload.get("status") != "passed":
+        raise ValueError("smoke_result.json status is not 'passed'")
+    if payload.get("finite") is not True:
+        raise ValueError("smoke_result.json finite is not true")
+
+
 def _run_all_smokes(output_directory: Path) -> int:
     output_directory.mkdir(parents=True, exist_ok=True)
     summary: dict[str, list] = {"passed": [], "skipped": [], "failed": []}
@@ -91,7 +112,14 @@ def _run_all_smokes(output_directory: Path) -> int:
         try:
             result = subprocess.run(
                 command, capture_output=True, text=True, env=environment,
+                timeout=model.timeout_s,
             )
+        except subprocess.TimeoutExpired:
+            result_path.unlink(missing_ok=True)
+            error = f"timed out after {model.timeout_s:g} seconds"
+            summary["failed"].append({"model_id": model_id, "error": error})
+            print(f"FAILED {model_id}: {error}")
+            continue
         except Exception as error:
             result_path.unlink(missing_ok=True)
             summary["failed"].append({"model_id": model_id, "error": str(error)})
@@ -103,10 +131,18 @@ def _run_all_smokes(output_directory: Path) -> int:
             error = f"exit code {result.returncode}: {detail}"
             summary["failed"].append({"model_id": model_id, "error": error})
             print(f"FAILED {model_id}: {error}")
-        else:
-            elapsed = time.perf_counter() - started
-            summary["passed"].append(model_id)
-            print(f"PASSED {model_id} ({elapsed:.3f}s)")
+            continue
+        try:
+            _validate_smoke_result(result_path, model_id)
+        except ValueError as validation_error:
+            result_path.unlink(missing_ok=True)
+            error = str(validation_error)
+            summary["failed"].append({"model_id": model_id, "error": error})
+            print(f"FAILED {model_id}: {error}")
+            continue
+        elapsed = time.perf_counter() - started
+        summary["passed"].append(model_id)
+        print(f"PASSED {model_id} ({elapsed:.3f}s)")
     write_json_atomic(output_directory / "smoke_summary.json", summary)
     return 1 if summary["failed"] else 0
 

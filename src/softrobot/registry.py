@@ -20,6 +20,7 @@ class ModelSpec:
     contact: str = "none"
     backend: str = "torch-cpu"
     source: str = "repository"
+    timeout_s: float = 60.0
 
     def load_main(self) -> Callable[[Sequence[str] | None], int | None]:
         return import_module(self.module).main

@@ -28,7 +28,8 @@ def cpu_smoke_runtime() -> Iterator[None]:
         torch_state = None
         torch_default_device = None
     else:
-        torch_state = torch.random.get_rng_state().clone()
+        torch_generator = torch.random.default_generator
+        torch_state = torch_generator.get_state().clone()
         torch_default_device = torch.get_default_device()
 
     try:
@@ -36,14 +37,14 @@ def cpu_smoke_runtime() -> Iterator[None]:
         np.random.seed(0)
         matplotlib.use("Agg", force=True)
         if torch is not None:
-            torch.manual_seed(0)
+            torch_generator.manual_seed(0)
             torch.set_default_device("cpu")
         yield
     finally:
         try:
             if torch is not None:
                 torch.set_default_device(torch_default_device)
-                torch.random.set_rng_state(torch_state)
+                torch_generator.set_state(torch_state)
         finally:
             try:
                 np.random.set_state(numpy_state)
