@@ -112,4 +112,3 @@ def test_repository_release_contract_documented() -> None:
         "pytest==", "setuptools==",
     ):
         assert requirement in lock
-
