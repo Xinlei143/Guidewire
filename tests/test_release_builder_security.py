@@ -116,6 +116,10 @@ def test_path_conflicts_and_casefold_duplicates_are_rejected() -> None:
         release._validate_unique_paths(["a", "a/b"], "test")
     with pytest.raises(release.ReleaseError, match="duplicate"):
         release._validate_unique_paths(["README.md", "readme.md"], "test")
+    with pytest.raises(release.ReleaseError, match="conflicting"):
+        release._validate_unique_paths(["A", "a/b"], "test")
+    with pytest.raises(release.ReleaseError, match="conflicting"):
+        release._validate_unique_paths(["dir", "DIR/file"], "test")
 
 
 def test_archive_verifier_rejects_hash_mismatch(tmp_path: Path) -> None:

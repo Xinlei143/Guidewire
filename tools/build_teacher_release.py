@@ -79,13 +79,15 @@ def _validate_unique_paths(paths: Iterable[str], context: str) -> tuple[str, ...
             raise ReleaseError(f"duplicate {context} path: {path!r} conflicts with {seen[key]!r}")
         seen[key] = path
         normalized.append(path)
-    exact = set(normalized)
+    folded_paths = {path.casefold(): path for path in normalized}
     for path in normalized:
         parts = path.split("/")
         for index in range(1, len(parts)):
-            prefix = "/".join(parts[:index])
-            if prefix in exact:
-                raise ReleaseError(f"conflicting {context} paths: {prefix!r} and {path!r}")
+            prefix_key = "/".join(parts[:index]).casefold()
+            if prefix_key in folded_paths:
+                raise ReleaseError(
+                    f"conflicting {context} paths: {folded_paths[prefix_key]!r} and {path!r}"
+                )
     return tuple(normalized)
 
 
