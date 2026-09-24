@@ -100,7 +100,8 @@ def test_repository_release_contract_documented() -> None:
     for phrase in (
         "softrobot models", "softrobot smoke --all", "--smoke-test",
         "python -m softrobot", "Python 3.10", "g++", "Ninja",
-        "smoke test 不是物理验证", "不提供正弦", "不提供自由插入",
+        "smoke test 不是物理验证", "老师版 ZIP 不含", "正弦插入", "自由插入",
+        "当前合并后的研究工作区仍保留",
     ):
         assert phrase in readme
     pyproject = (REPO / "pyproject.toml").read_text(encoding="utf-8")

@@ -22,3 +22,8 @@ def test_scaffold_tests_find_src_without_external_pythonpath() -> None:
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert "12 passed" in result.stdout
+
+
+def test_default_collection_excludes_local_history_copies() -> None:
+    config = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert 'testpaths = ["tests"]' in config
