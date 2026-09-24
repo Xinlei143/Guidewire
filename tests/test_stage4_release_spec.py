@@ -60,8 +60,9 @@ def test_environment_evidence_distinguishes_distribution_from_cpu_acceptance() -
     ))
     for evidence in ("Python 3.10.20", "2.11.0+cu130", "CUDA-enabled distribution"):
         assert evidence in texts
-    assert "CPU-only wheel itself was not part of this acceptance" in texts
-    assert "CUDA availability and execution were not queried or validated" in texts
+    assert "CPU-only wheel 未单独验收" in texts
+    assert "torch.cuda.is_available()" in texts
+    assert "availability gate" in texts
 
 
 def test_documented_install_command_is_exact_and_offline_capable() -> None:

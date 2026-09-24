@@ -22,7 +22,8 @@
 Pillow、pytest、setuptools，以及 g++/Ninja。CUDA 不是依赖，也没有作为验收条件。
 精确验收版本与新环境命令见 `requirements-cpu.lock` 和 `docs/environment.md`。
 本次解释器是 Python 3.10.20；已安装的 `torch.__version__` 为 `2.11.0+cu130`（CUDA-enabled distribution），
-但全部验收显式使用 CPU，未调用或验收 CUDA，也未单独验证 CPU-only wheel。
+所有实际模型与 smoke 显式使用 CPU，没有执行或验收 CUDA 算例。完整 pytest 中 `torch.cuda.is_available()`
+仅作为 CUDA-only 测试的 availability gate；由此产生的 skip 不代表 CPU 功能缺陷。CPU-only wheel 未单独验收。
 
 已有依赖时可离线安装：
 
@@ -60,7 +61,9 @@ python -m softrobot.foundations.implicit_newton_3d --smoke-test --output-dir /tm
 ```
 
 registry 中 19 个 Model ID 各自对应唯一模块入口。曲管 analytic/mesh 模块各自预置正确
-接触类型和规范资产；用户显式提供的同名长选项会覆盖预置。不带 `--smoke-test` 时保留历史模型原有默认参数和算例语义。smoke 模式才会缩小节点
+接触类型和规范资产；用户显式提供的同名长选项会覆盖预置。`softrobot.curved_tube.v4_mesh`
+默认配对 `arc90_L1p5m_xz_wallR60mm_protectionR50mm_64sides_axial256.obj` 与
+`arc90_L1p5m_xz_centerline_800.csv`；CSV 列为 `x,y,z`、`y=0`，曲线位于 xz 平面。不带 `--smoke-test` 时保留历史模型原有默认参数和算例语义。smoke 模式才会缩小节点
 数、步数和输出规模，并固定为 CPU、Matplotlib Agg 无头后端和确定性随机种子。
 
 ## 3. 模型状态与 smoke 覆盖
