@@ -14,6 +14,7 @@ import time
 from collections.abc import Iterator, Sequence
 
 from ._smoke import write_json_atomic
+from .common.assets import geometry_asset
 from .registry import get_model, model_ids
 
 
@@ -68,10 +69,9 @@ def _merge_default_model_args(defaults: Sequence[str], explicit: Sequence[str]) 
 
 
 def _resolve_preset_resources(arguments: Sequence[str]) -> list[str]:
-    resource_root = Path(__file__).resolve().parent / "resources" / "tube_obj"
     replacements = {
-        "__ARC_CENTERLINE__": str(resource_root / "arc90_L1p5m_centerline_800.csv"),
-        "__ARC_MESH__": str(resource_root / "arc90_L1p5m_xz_wallR60mm_protectionR50mm_64sides_axial256.obj"),
+        "__ARC_CENTERLINE__": str(geometry_asset("arc90_L1p5m_centerline_800.csv")),
+        "__ARC_MESH__": str(geometry_asset("arc90_L1p5m_xz_wallR60mm_protectionR50mm_64sides_axial256.obj")),
     }
     return [replacements.get(value, value) for value in arguments]
 

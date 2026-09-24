@@ -23,12 +23,11 @@ import torch.nn.functional as F
 
 from . import v3
 from ..common.cli import cli_arguments
+from ..common.assets import geometry_asset
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_MESH_OBJ = (
-    ROOT / "resources" / "tube_obj" / "straight_tube_L1p5m_boundaryR50mm_shellR60mm_32sides_axial2.obj"
-)
+DEFAULT_MESH_OBJ = geometry_asset("straight_tube_L1p5m_boundaryR50mm_shellR60mm_32sides_axial2.obj")
 CONTACT_SMOOTH_LENGTH = v3.CONTACT_SMOOTH_LENGTH
 MESH_CACHE_GLOBAL_REFRESH_INTERVAL = 50  # 每隔多少个已接受隐式步用 uniform grid 全量校验一次
 

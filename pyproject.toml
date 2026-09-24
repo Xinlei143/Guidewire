@@ -31,5 +31,10 @@ pythonpath = ["src"]
 [tool.setuptools.package-data]
 softrobot = [
     "backends/cpp/*",
-    "resources/tube_obj/*",
+]
+
+[tool.setuptools.data-files]
+"assets/geometry" = [
+    "assets/geometry/*.obj",
+    "assets/geometry/*.csv",
 ]

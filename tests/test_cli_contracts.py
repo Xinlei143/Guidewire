@@ -10,7 +10,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 RELATIVE_MESH = Path(
-    "src/softrobot/resources/tube_obj/"
+    "assets/geometry/"
     "straight_tube_L1p5m_boundaryR50mm_shellR60mm_32sides_axial2.obj"
 )
 

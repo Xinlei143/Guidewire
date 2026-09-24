@@ -12,8 +12,8 @@ from softrobot.straight_tube import v4
 
 
 ROOT = Path(__file__).resolve().parents[1]
-OBJ = ROOT / "src" / "softrobot" / "resources" / "tube_obj" / "arc90_L1p5m_xz_wallR60mm_protectionR50mm_64sides_axial256.obj"
-CENTERLINE = ROOT / "src" / "softrobot" / "resources" / "tube_obj" / "arc90_L1p5m_xz_centerline_800.csv"
+OBJ = ROOT / "assets" / "geometry" / "arc90_L1p5m_xz_wallR60mm_protectionR50mm_64sides_axial256.obj"
+CENTERLINE = ROOT / "assets" / "geometry" / "arc90_L1p5m_xz_centerline_800.csv"
 GENERATOR = ROOT / "tools" / "generate_arc_vessel_3d.py"
 RADIUS = 0.9549298123336835
 

@@ -3,14 +3,14 @@
 这是面向课程/研究复核的 CPU 代码包。代码按物理任务组织，而不是按文件产生时间堆放：
 
 ```text
-src/softrobot/
-├── foundations/       基础杆：伸长、弯曲、隐式 Newton、cantilever
-├── contact/           基础 PI 软接触：动态与准静态
-├── straight_tube/     直管：2-D、3-D v2/v3、mesh、当前 v4
-├── curved_tube/       弯管：2-D、旧 3-D analytic/mesh、当前 v4
-├── common/            中轴线与共享命令行工具
-├── backends/          C++ 扩展、网格接触和 Python/C++ 边界
-└── resources/tube_obj 运行所需的规范 OBJ/CSV 几何
+├── src/softrobot/
+│   ├── foundations/       基础杆：伸长、弯曲、隐式 Newton、cantilever
+│   ├── contact/           基础 PI 软接触：动态与准静态
+│   ├── straight_tube/     直管：2-D、3-D v2/v3、mesh、当前 v4
+│   ├── curved_tube/       弯管：2-D、旧 3-D analytic/mesh、当前 v4
+│   ├── common/            中轴线与共享命令行工具
+│   └── backends/          C++ 扩展、网格接触和 Python/C++ 边界
+└── assets/geometry/        运行所需的规范 OBJ/CSV 几何（仓库根目录）
 ```
 
 报告、原始实验数据、历史输出、媒体、缓存、第三方源码、正弦插入和自由插入研究线不在
@@ -25,7 +25,7 @@ Pillow、pytest、setuptools，以及 g++/Ninja。CUDA 不是依赖，也没有�
 已有依赖时可离线安装：
 
 ```bash
-python3.10 -m pip install --no-deps .
+python -m pip install --no-deps --no-build-isolation .
 softrobot models
 ```
 

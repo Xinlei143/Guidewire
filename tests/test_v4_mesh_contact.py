@@ -13,8 +13,8 @@ from softrobot.straight_tube import v4
 
 
 ROOT = Path(__file__).resolve().parents[1]
-OBJ = ROOT / "src" / "softrobot" / "resources" / "tube_obj" / "straight_tube_L1p5m_boundaryR50mm_shellR60mm_32sides_axial2.obj"
-CURVED_OBJ = ROOT / "src" / "softrobot" / "resources" / "tube_obj" / "arc90_L1p5m_xz_wallR60mm_protectionR50mm_64sides_axial256.obj"
+OBJ = ROOT / "assets" / "geometry" / "straight_tube_L1p5m_boundaryR50mm_shellR60mm_32sides_axial2.obj"
+CURVED_OBJ = ROOT / "assets" / "geometry" / "arc90_L1p5m_xz_wallR60mm_protectionR50mm_64sides_axial256.obj"
 
 
 def _write_indexed_obj(path, vertices, faces, flip_faces=()):

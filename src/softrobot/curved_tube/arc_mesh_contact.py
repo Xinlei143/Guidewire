@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 import math
 from pathlib import Path
 
+from ..common.assets import geometry_asset
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -45,9 +47,7 @@ class MeshContactCache:
 
 
 def default_obj_path() -> Path:
-    return Path(__file__).resolve().with_name(
-        "arc_tube_L1p5m_A90deg_protectionR40mm_192x240_tri.obj"
-    )
+    return geometry_asset("arc90_legacy_protectionR40mm_40x80.obj")
 
 
 def _arc_centerline(radius: float, theta: np.ndarray) -> np.ndarray:

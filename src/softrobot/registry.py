@@ -99,8 +99,11 @@ _MODELS = {
 }
 
 
+_TASK_ORDER = {"foundation": 0, "contact": 1, "straight": 2, "curved": 3}
+
+
 def model_ids() -> tuple[str, ...]:
-    return tuple(sorted(_MODELS))
+    return tuple(sorted(_MODELS, key=lambda model_id: (_TASK_ORDER[model_id.split("-", 1)[0]], model_id)))
 
 
 def get_model(model_id: str) -> ModelSpec:

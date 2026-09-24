@@ -85,6 +85,8 @@ def test_release_rejects_dirty_tracked_tree(tmp_path: Path) -> None:
         "src/.cpp_extension_build/x.o", "third_party/eigen.h", "data/run.npz",
         "paper.pdf", "movie.mp4", "bundle.zip", "tests/benchmark_speed.py",
         "src/softrobot/backends/cpp/benchmark_der_core.py",
+        "src/softrobot/resources/tube_obj/duplicate.obj",
+        "history/duplicate.csv",
         "tests/test_export_portfolio_figures.py",
         "tools/export_portfolio_figures.py", "portfolio_evidence/manifest.json",
     ],
@@ -107,7 +109,7 @@ def test_repository_release_contract_documented() -> None:
     lock = (REPO / "requirements-cpu.lock").read_text(encoding="utf-8")
     for requirement in (
         "numpy==", "scipy==", "torch==", "matplotlib==", "Pillow==",
-        "pytest==", "setuptools==", "ninja==",
+        "pytest==", "setuptools==",
     ):
         assert requirement in lock
 

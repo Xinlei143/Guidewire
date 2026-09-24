@@ -7,25 +7,25 @@ import pytest
 
 
 EXPECTED_MODEL_IDS = (
+    "foundation-2d-stretch-bend-torch",
+    "foundation-2d-stretch-numpy",
+    "foundation-3d-implicit-newton",
+    "foundation-3d-stretch-bend-torch",
+    "foundation-cantilever-der",
     "contact-2d-dynamic-pi",
     "contact-2d-quasistatic-pi-v1",
     "contact-2d-quasistatic-pi-v2",
+    "straight-tube-2d-pi",
+    "straight-tube-mesh-3d",
+    "straight-tube-v2-3d",
+    "straight-tube-v3",
+    "straight-tube-v4",
     "curved-tube-2d-arc",
     "curved-tube-2d-legacy-python",
     "curved-tube-3d-legacy-analytic",
     "curved-tube-3d-legacy-mesh",
     "curved-tube-v4-analytic",
     "curved-tube-v4-mesh",
-    "foundation-2d-stretch-bend-torch",
-    "foundation-2d-stretch-numpy",
-    "foundation-3d-implicit-newton",
-    "foundation-3d-stretch-bend-torch",
-    "foundation-cantilever-der",
-    "straight-tube-2d-pi",
-    "straight-tube-mesh-3d",
-    "straight-tube-v2-3d",
-    "straight-tube-v3",
-    "straight-tube-v4",
 )
 
 
@@ -90,7 +90,7 @@ def test_packaged_resource_paths_exist() -> None:
 
     assert quasi_static_mesh_3d.DEFAULT_MESH_OBJ.is_file()
     assert v4.MESH_OBJ_DEFAULT.is_file()
-    assert "softrobot/resources/tube_obj" in v4.MESH_OBJ_DEFAULT.as_posix()
+    assert "assets/geometry" in v4.MESH_OBJ_DEFAULT.as_posix()
     assert (Path(der_cpp_backend.__file__).parent / "cpp" / "bindings.cpp").is_file()
 
 

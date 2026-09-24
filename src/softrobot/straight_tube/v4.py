@@ -23,6 +23,7 @@ import torch.nn.functional as F
 from ..backends import mesh_contact_v4
 from ..common.centerline_3d import Centerline3D
 from ..common.cli import cli_arguments
+from ..common.assets import geometry_asset
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,7 +36,7 @@ DTYPE = torch.float64
 DEVICE_DEFAULT = "auto"
 BACKEND_DEFAULT = "cpp"
 CONTACT_TYPE_DEFAULT = "tube"
-MESH_OBJ_DEFAULT = ROOT / "resources" / "tube_obj" / "straight_tube_L1p5m_boundaryR50mm_shellR60mm_32sides_axial2.obj"
+MESH_OBJ_DEFAULT = geometry_asset("straight_tube_L1p5m_boundaryR50mm_shellR60mm_32sides_axial2.obj")
 CENTERLINE_CSV_DEFAULT = None
 CURVED_TUBE_RADIUS = 60.0e-3
 CURVED_TUBE_SAFE_DISTANCE = 10.0e-3

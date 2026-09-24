@@ -14,6 +14,7 @@ import numpy as np
 
 from ._smoke import cpu_smoke_runtime, write_smoke_result
 from .common.cli import cli_arguments
+from .common.assets import geometry_asset
 
 _MODULES = {
     "straight-tube-2d-pi": "softrobot.straight_tube.legacy_pi_2d",
@@ -202,7 +203,7 @@ def _arc2d(module: ModuleType, backend: str, current: bool):
 
 def _legacy_arc3d(module: ModuleType, contact_type: str):
     import torch
-    resource = Path(__file__).resolve().parent / "resources" / "tube_obj" / "arc90_legacy_protectionR40mm_40x80.obj"
+    resource = geometry_asset("arc90_legacy_protectionR40mm_40x80.obj")
     with cli_arguments([
         "--contact-type", contact_type, "--mesh-obj", str(resource), "--device", "cpu",
         "--num-nodes", "8", "--pulse-count-min", "1", "--pulse-count-max", "1",
@@ -232,7 +233,6 @@ def _legacy_arc3d(module: ModuleType, contact_type: str):
 
 def _v4(module: ModuleType, model_id: str, backend: str, mesh: bool, name: str):
     import torch
-    resources = Path(module.__file__).resolve().parents[1] / "resources" / "tube_obj"
     curved = model_id.startswith("curved-")
     contact_type = "mesh" if mesh else ("curved-tube" if curved else "tube")
     arguments = [
@@ -242,13 +242,13 @@ def _v4(module: ModuleType, model_id: str, backend: str, mesh: bool, name: str):
     ]
     mesh_path = None
     if mesh:
-        mesh_path = resources / (
+        mesh_path = geometry_asset(
             "arc90_L1p5m_xz_wallR60mm_protectionR50mm_64sides_axial256.obj"
             if curved else "straight_tube_L1p5m_boundaryR50mm_shellR60mm_32sides_axial2.obj"
         )
         arguments += ["--mesh-obj", str(mesh_path)]
         if curved:
-            arguments += ["--centerline-csv", str(resources / "arc90_L1p5m_xz_centerline_800.csv")]
+            arguments += ["--centerline-csv", str(geometry_asset("arc90_L1p5m_xz_centerline_800.csv"))]
     with cli_arguments(arguments):
         args = module._parse_args_with_backend()
     arrays = module.initialize_rod(

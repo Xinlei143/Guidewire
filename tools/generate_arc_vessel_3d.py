@@ -11,8 +11,8 @@ import numpy as np
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_OBJ = ROOT / "src" / "softrobot" / "resources" / "tube_obj" / "arc90_L1p5m_xz_wallR60mm_protectionR50mm_64sides_axial256.obj"
-DEFAULT_CENTERLINE = ROOT / "src" / "softrobot" / "resources" / "tube_obj" / "arc90_L1p5m_xz_centerline_800.csv"
+DEFAULT_OBJ = ROOT / "assets" / "geometry" / "arc90_L1p5m_xz_wallR60mm_protectionR50mm_64sides_axial256.obj"
+DEFAULT_CENTERLINE = ROOT / "assets" / "geometry" / "arc90_L1p5m_xz_centerline_800.csv"
 
 
 def chord_corrected_radius(length: float, angle: float, node_count: int) -> float:

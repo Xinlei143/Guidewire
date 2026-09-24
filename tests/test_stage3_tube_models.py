@@ -138,7 +138,7 @@ def test_lineage_records_packaged_legacy_arc_mesh_hash() -> None:
 
     root = Path(__file__).parents[1]
     relative_asset = Path(
-        "src/softrobot/resources/tube_obj/arc90_legacy_protectionR40mm_40x80.obj"
+        "assets/geometry/arc90_legacy_protectionR40mm_40x80.obj"
     )
     digest = hashlib.sha256((root / relative_asset).read_bytes()).hexdigest()
     lineage = (root / "docs" / "model_lineage.md").read_text(encoding="utf-8")
