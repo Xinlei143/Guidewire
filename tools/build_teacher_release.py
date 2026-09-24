@@ -48,8 +48,10 @@ def exclusion_reason(path: str) -> str | None:
         return "excluded research line"
     if PurePosixPath(folded).suffix in FORBIDDEN_SUFFIXES:
         return "forbidden generated or binary extension"
-    if folded.startswith("tests/benchmark_"):
-        return "benchmark test"
+    if PurePosixPath(folded).name.startswith("benchmark_"):
+        return "benchmark helper or test"
+    if folded == "tests/test_export_portfolio_figures.py":
+        return "report generator test"
     if folded == "tools/export_portfolio_figures.py" or folded.startswith("portfolio_evidence/"):
         return "report or portfolio generator"
     if any(part in {"output", "outputs"} for part in PurePosixPath(folded).parts):

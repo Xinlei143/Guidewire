@@ -460,9 +460,13 @@ def test_stage_two_source_tree_contains_no_source_junk() -> None:
     forbidden_suffixes = {".docx", ".mat", ".npz", ".pyc"}
     result = subprocess.run(
         ["git", "ls-files", "src/softrobot/foundations", "src/softrobot/contact"],
-        cwd=ROOT, capture_output=True, text=True, check=True,
+        cwd=ROOT, capture_output=True, text=True, check=False,
     )
-    files = [Path(line) for line in result.stdout.splitlines()]
+    if result.returncode == 0:
+        files = [Path(line) for line in result.stdout.splitlines()]
+    else:
+        files = [path.relative_to(ROOT) for directory in ("foundations", "contact")
+                 for path in (ROOT / "src/softrobot" / directory).rglob("*") if path.is_file()]
 
     assert files
     assert not [path for path in files if path.suffix.lower() in forbidden_suffixes]

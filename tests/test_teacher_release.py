@@ -84,6 +84,8 @@ def test_release_rejects_dirty_tracked_tree(tmp_path: Path) -> None:
         "src/正弦模型.py", "__MACOSX/x", "src/__pycache__/x.pyc",
         "src/.cpp_extension_build/x.o", "third_party/eigen.h", "data/run.npz",
         "paper.pdf", "movie.mp4", "bundle.zip", "tests/benchmark_speed.py",
+        "src/softrobot/backends/cpp/benchmark_der_core.py",
+        "tests/test_export_portfolio_figures.py",
         "tools/export_portfolio_figures.py", "portfolio_evidence/manifest.json",
     ],
 )
