@@ -46,8 +46,11 @@ def exclusion_reason(path: str) -> str | None:
         return "forbidden path component"
     if any(fragment in folded for fragment in FORBIDDEN_FRAGMENTS):
         return "excluded research line"
-    if PurePosixPath(folded).suffix in FORBIDDEN_SUFFIXES:
+    suffix = PurePosixPath(folded).suffix
+    if suffix in FORBIDDEN_SUFFIXES:
         return "forbidden generated or binary extension"
+    if suffix in {".obj", ".csv"} and not folded.startswith("assets/geometry/"):
+        return "noncanonical geometry location"
     if PurePosixPath(folded).name.startswith("benchmark_"):
         return "benchmark helper or test"
     if folded == "tests/test_export_portfolio_figures.py":
