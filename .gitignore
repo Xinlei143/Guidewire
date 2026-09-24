@@ -1,5 +1,5 @@
-__pycache__/
-*.pyc
+**/__pycache__/
+*.py[cod]
 *.npz
 
 .vscode/browse.vc.db*
@@ -8,6 +8,16 @@ __pycache__/
 .vscode/*.db-wal
 
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+build/
+dist/
+*.egg-info/
+output/
+outputs/
+media/
+third_party/
 
 # LaTeX build artifacts
 *.aux
@@ -26,11 +36,10 @@ __pycache__/
 .codex
 .vscode
 
-
-.vscode
 3d_npz
 3d_picture
 deliverables
+# Preserve the research checkout's existing untracked documentation boundary.
 docs
 !docs/
 docs/*
@@ -44,6 +53,6 @@ soft_robot_chain_bending_stretching_torsion.py
 portfolio_evidence/*
 !portfolio_evidence/manifest.json
 
-# Local report bundle and historical guidewire archive; not part of Git backups.
+# Local report bundle and historical guidewire archive; never push these trees.
 /wire_report/
 /血管导丝/

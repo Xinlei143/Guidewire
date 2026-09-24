@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import torch
 
-import der_cpp_backend as backend
+from softrobot.backends import der_cpp_backend as backend
 
 
 EI = 1.7

@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import torch
 
-import rod_soft_contact_PI_dynamic_quasi_static_2d_arc as rod
+from softrobot.curved_tube import arc_2d as rod
 
 
 def test_final_perturbation_cli_defaults_and_rejects_negative_scale():

@@ -1,11 +1,11 @@
 import numpy as np
 import pytest
-import der_cpp_backend as backend
+from softrobot.backends import der_cpp_backend as backend
 import torch
 from pathlib import Path
 
-import rod_soft_contact_PI_dynamic_quasi_static_3d_v3 as rod
-import rod_soft_contact_PI_dynamic_quasi_static_3d_v4 as v4
+from softrobot.straight_tube import v3 as rod
+from softrobot.straight_tube import v4
 
 
 def test_cpp_implicit_step_reuses_a_per_call_solver_workspace():
@@ -539,10 +539,10 @@ def test_v4_import_does_not_load_v3_module():
     import sys
 
     env = os.environ.copy()
-    env["PYTHONPATH"] = "."
+    env["PYTHONPATH"] = os.pathsep.join(("src", "."))
     code = (
-        "import sys; import rod_soft_contact_PI_dynamic_quasi_static_3d_v4; "
-        "assert 'rod_soft_contact_PI_dynamic_quasi_static_3d_v3' not in sys.modules"
+        "import sys; from softrobot.straight_tube import v4; "
+        "assert 'softrobot.straight_tube.v3' not in sys.modules"
     )
     result = subprocess.run(
         [sys.executable, "-c", code], capture_output=True, text=True,
