@@ -466,7 +466,8 @@ def test_stage_two_source_tree_contains_no_source_junk() -> None:
         files = [Path(line) for line in result.stdout.splitlines()]
     else:
         files = [path.relative_to(ROOT) for directory in ("foundations", "contact")
-                 for path in (ROOT / "src/softrobot" / directory).rglob("*") if path.is_file()]
+                 for path in (ROOT / "src/softrobot" / directory).rglob("*")
+                 if path.is_file() and "__pycache__" not in path.parts]
 
     assert files
     assert not [path for path in files if path.suffix.lower() in forbidden_suffixes]
