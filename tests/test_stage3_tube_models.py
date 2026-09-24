@@ -115,6 +115,28 @@ def test_no_forbidden_historical_payloads_are_packaged() -> None:
             assert not path.read_bytes().startswith(b"\xef\xbb\xbf"), path
 
 
+def test_lineage_records_packaged_legacy_arc_mesh_hash() -> None:
+    import hashlib
+
+    root = Path(__file__).parents[1]
+    relative_asset = Path(
+        "src/softrobot/resources/tube_obj/arc90_legacy_protectionR40mm_40x80.obj"
+    )
+    digest = hashlib.sha256((root / relative_asset).read_bytes()).hexdigest()
+    lineage = (root / "docs" / "model_lineage.md").read_text(encoding="utf-8")
+
+    assert digest == "9d68298882fe013ea3ef24a125d268ad49a3b0f40be910d4aeb3e8f75c79354a"
+    assert (
+        f"packaged LF-normalized `{relative_asset.as_posix()}` SHA256 `{digest}`"
+        in lineage
+    )
+    assert (
+        "source OBJ snapshot SHA256 "
+        "`88ba95136f106cb23cc76c2f73b6fdee0aae47cde7e4f4c5283fbc2707ed05eb`"
+        in lineage
+    )
+
+
 @pytest.mark.parametrize(
     ("module_name", "function_name"),
     (
