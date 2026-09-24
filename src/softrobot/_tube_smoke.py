@@ -36,15 +36,39 @@ def _variant(name: str, backend: str, initial, result, force, active, info, star
     before = initial.detach().cpu().numpy() if torch.is_tensor(initial) else np.asarray(initial)
     force_array = force.detach().cpu().numpy() if torch.is_tensor(force) else np.asarray(force)
     active_array = active.detach().cpu().numpy() if torch.is_tensor(active) else np.asarray(active)
+    if not np.isfinite(before).all():
+        raise RuntimeError(f"{name} production initial state is not finite")
+    if not np.isfinite(state).all():
+        raise RuntimeError(f"{name} production state is not finite")
+    if not np.isfinite(force_array).all():
+        raise RuntimeError(f"{name} production contact force is not finite")
+    with np.errstate(over="ignore", invalid="ignore"):
+        delta = state - before
+        state_delta_norm = float(np.linalg.norm(delta))
+        contact_force_norm = float(np.linalg.norm(force_array))
+    if not np.isfinite(delta).all() or not math.isfinite(state_delta_norm):
+        raise RuntimeError(f"{name} production state delta is not finite")
+    if not math.isfinite(contact_force_norm):
+        raise RuntimeError(f"{name} production contact force norm is not finite")
+    if isinstance(info.iterations, (bool, np.bool_)) or not isinstance(
+        info.iterations, (int, np.integer),
+    ):
+        raise RuntimeError(f"{name} production Newton iterations are invalid")
+    iterations = int(info.iterations)
+    if iterations < 1:
+        raise RuntimeError(f"{name} production Newton iterations must be at least one")
+    residual = float(info.residual_norm)
+    if not math.isfinite(residual) or residual < 0.0:
+        raise RuntimeError(f"{name} production Newton residual is invalid")
     evidence = {
         "name": name,
         "backend": backend,
-        "finite": bool(np.isfinite(state).all() and np.isfinite(force_array).all()),
+        "finite": True,
         "converged": bool(info.converged),
-        "iterations": max(1, int(info.iterations)),
-        "residual": max(0.0, float(info.residual_norm)),
-        "state_delta_norm": float(np.linalg.norm(state - before)),
-        "contact_force_norm": float(np.linalg.norm(force_array)),
+        "iterations": iterations,
+        "residual": residual,
+        "state_delta_norm": state_delta_norm,
+        "contact_force_norm": contact_force_norm,
         "contact_count": int(np.count_nonzero(active_array)),
         "elapsed_s": time.perf_counter() - started,
         **extra,
@@ -276,6 +300,7 @@ def _run_variants(model_id: str, module: ModuleType):
         return [
             _v4(module, model_id, "python", False, "python+tube"),
             _v4(module, model_id, "cpp", False, "cpp+tube"),
+            _v4(module, model_id, "python", True, "python+straight-mesh"),
             _v4(module, model_id, "cpp", True, "cpp+straight-mesh"),
         ]
     if model_id == "curved-tube-v4-analytic":
@@ -293,6 +318,8 @@ def run_smoke(argv=None, default_model_id: str | None = None) -> int:
     model_id = os.environ.get("SOFTROBOT_SMOKE_MODEL_ID", default_model_id)
     if not known.smoke_test or not model_id:
         return -1
+    result_path = Path(known.output_dir) / "smoke_result.json"
+    result_path.unlink(missing_ok=True)
     module = import_module(_MODULES[model_id])
     with cpu_smoke_runtime():
         pairs = _run_variants(model_id, module)

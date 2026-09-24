@@ -233,14 +233,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     model_args = _absolutize_input_paths(model_args, model.input_path_options, invocation_directory)
     output_directory = _absolute_path(str(args.output_dir), invocation_directory)
     output_directory.mkdir(parents=True, exist_ok=True)
+    result_path = output_directory / "smoke_result.json"
     if args.smoke_test:
+        result_path.unlink(missing_ok=True)
         model_args.extend(("--smoke-test", "--output-dir", "."))
     previous_model_id = os.environ.get("SOFTROBOT_SMOKE_MODEL_ID")
     if args.smoke_test:
         os.environ["SOFTROBOT_SMOKE_MODEL_ID"] = model.model_id
     try:
-        with _working_directory(output_directory):
-            result = model.load_main()(model_args)
+        try:
+            with _working_directory(output_directory):
+                result = model.load_main()(model_args)
+            if args.smoke_test:
+                _validate_smoke_result(result_path, model.model_id)
+        except Exception:
+            if args.smoke_test:
+                result_path.unlink(missing_ok=True)
+            raise
     finally:
         if args.smoke_test:
             if previous_model_id is None:
