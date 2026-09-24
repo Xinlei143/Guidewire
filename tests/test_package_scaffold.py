@@ -7,14 +7,22 @@ import pytest
 
 
 EXPECTED_MODEL_IDS = (
+    "contact-2d-dynamic-pi",
+    "contact-2d-quasistatic-pi-v1",
+    "contact-2d-quasistatic-pi-v2",
     "curved-tube-2d-arc",
+    "foundation-2d-stretch-bend-torch",
+    "foundation-2d-stretch-numpy",
+    "foundation-3d-implicit-newton",
+    "foundation-3d-stretch-bend-torch",
+    "foundation-cantilever-der",
     "straight-tube-mesh-3d",
     "straight-tube-v3",
     "straight-tube-v4",
 )
 
 
-def test_registry_lists_stage_one_models() -> None:
+def test_registry_lists_all_packaged_models() -> None:
     from softrobot.registry import model_ids
 
     assert model_ids() == EXPECTED_MODEL_IDS
