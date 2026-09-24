@@ -1,0 +1,13 @@
+# Versions verified in the local Linux/Python 3.10 teacher-release environment.
+# PyTorch is CPU-only for this release; obtain its CPU wheel from
+# https://download.pytorch.org/whl/cpu when preparing a new online environment.
+# No CUDA runtime is required or validated.
+numpy==2.2.6
+scipy==1.15.3
+torch==2.11.0
+matplotlib==3.10.9
+Pillow==12.2.0
+pytest==9.0.3
+setuptools==81.0.0
+# The verified Ninja executable reports 1.13.0; it is used with g++ for C++ extensions.
+ninja==1.13.0
