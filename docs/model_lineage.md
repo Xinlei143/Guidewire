@@ -14,8 +14,6 @@ This inventory records source provenance and classification only. It does not as
 
 `proof_analysis.py` (source SHA256 `bdced1a03b34c342ba2c2a8974a9c8da1ec8df857de82371ed740568878f3bf4`) is retained under `softrobot.foundations` as a supporting analytical tool and is intentionally not registered as a model.
 
-Cantilever displacement validation uses the existing model. Its optional parameter-matched MATLAB script is `validation/cosserat/CantileverRodStretchBendCompare.m`, restored byte-for-byte from local Git ancestor `eb33bf34658a472d393a2775fb35e3517f875cdd` (`Cosserat rod model/CantileverRodStretchBendCompare.m`), SHA256 `19f2c1d7799df500ab79cdec131a88f6dac14d76ba47d4ba45303eaa1e5a36ff`. The accompanying `tools/validate_cantilever_displacement.py` and `docs/cantilever_validation.md` provide a CPU static-energy and EB comparison; neither is a new model. The suspected third-party `untitled.m` is excluded; method background only is cited to [Till, Aloi and Rucker (2019)](https://journals.sagepub.com/doi/10.1177/0278364919842269), without a byte-level provenance claim.
-
 The distinct torsion prototype `soft_robot_chain_bending_stretching_torsion.py` was tracked in local Git history at `f04555b` and has SHA256 `a71dfce3662e99fd462cfc857b5b4a0b394274ae694b5166267a8193eee00b6d`. It is intentionally not imported in this release: the attachment lacks its historical NumPy `soft_robot_common.py` dependency (present in local ancestor `4c1b376`), and it must not be presented as compatible with the packaged Torch helper.
 
 ## Contact
@@ -26,7 +24,7 @@ The distinct torsion prototype `soft_robot_chain_bending_stretching_torsion.py` 
 | `contact-2d-quasistatic-pi-v1` | attachment root `rod_soft_contact_PI_dynamic_quasi_static.py` | untracked attachment file SHA256 `1a0b234ef0693053d2296a99e5b023888c31fe6f913d099f6b551610a40a894b` | Retained separately: pure-proportional `KI=0` branch; smoke records updated integral state and the definitionally zero integral-force term |
 | `contact-2d-quasistatic-pi-v2` | attachment root `rod_soft_contact_PI_dynamic_quasi_static_v2.py` | untracked attachment file SHA256 `baa0c14e3b9b12bd93b14b0def26c03006b494b4eed61f5f69cb5398945d76cf` | Retained separately: `KI=400`; smoke records positive integral state/force contribution and real active contact, so it is not a content duplicate of v1 |
 
-Excluded from the attachment working-tree import: `.git`, caches, `.DS_Store`, DOCX, other MATLAB scripts (including the suspected third-party `untitled.m`), NPZ, media, and all generated outputs. The sole retained matched-parameter MATLAB comparison was restored from the local Git ancestor, as recorded above.
+Excluded from the attachment working-tree import: `.git`, caches, `.DS_Store`, DOCX, MATLAB scripts (including the suspected third-party `untitled.m`), NPZ, media, and all generated outputs. The earlier mismatched point-load/EB and custom MATLAB displacement comparisons were removed; they do not validate the paper-example gravity equilibrium case.
 
 ## Straight and curved tube lineage
 

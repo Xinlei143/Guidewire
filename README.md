@@ -126,9 +126,6 @@ smoke test 不是物理验证，也不能支持精度、稳定性、性能、硬
 它只证明在所列 CPU 环境中，小参数端到端路径能结束并产生结构上有效的结果。正式结果
 仍需独立的网格/步长收敛研究、基准对照和任务级验证。
 
-无接触悬臂杆的指定节点点力位移、Euler–Bernoulli 小挠度参考和可选 MATLAB Cosserat
-对照见 `docs/cantilever_validation.md`；它沿用现有 `foundation-cantilever-der`，不增加模型 ID。
-
 ## 6. 可复现老师版 ZIP
 
 发布构建器只读取指定 Git commit，不读取未跟踪文件；tracked 工作树不干净时会拒绝

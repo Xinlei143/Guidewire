@@ -229,7 +229,7 @@ def _run(args: argparse.Namespace) -> int:
     if args.eb_beam:
         from .eb_beam_validation import (
             eb_tip_load_skip_reason,
-            euler_bernoulli_point_load_positions,
+            euler_bernoulli_tip_load_positions,
         )
         from .visualization import plot_eb_beam_comparison
 
@@ -241,12 +241,11 @@ def _run(args: argparse.Namespace) -> int:
             gravity=args.gravity,
         )
         if eb_skip_reason is None:
-            eb_positions = euler_bernoulli_point_load_positions(
+            eb_positions = euler_bernoulli_tip_load_positions(
                 initial_positions=initial_positions,
                 force_vector=external_forces[force_node],
                 B=args.bend_stiffness,
                 fixed_indices=fixed_indices,
-                force_node=force_node,
             )
             plot_eb_beam_comparison(
                 initial_positions=initial_positions,
