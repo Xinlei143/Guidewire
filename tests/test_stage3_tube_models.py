@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import json
 from pathlib import Path
 import subprocess
@@ -112,3 +113,77 @@ def test_no_forbidden_historical_payloads_are_packaged() -> None:
         assert path.suffix.lower() not in forbidden_suffixes, path
         if path.is_file() and path.suffix == ".py":
             assert not path.read_bytes().startswith(b"\xef\xbb\xbf"), path
+
+
+@pytest.mark.parametrize(
+    ("module_name", "function_name"),
+    (
+        ("softrobot.straight_tube.legacy_pi_2d", "implicit_euler_step"),
+        ("softrobot.straight_tube.v2", "implicit_euler_step"),
+        ("softrobot.straight_tube.v3", "implicit_euler_step"),
+        ("softrobot.straight_tube.quasi_static_mesh_3d", "mesh_implicit_euler_step"),
+        ("softrobot.curved_tube.legacy_arc_2d", "implicit_euler_step"),
+        ("softrobot.curved_tube.legacy_arc_3d", "implicit_step"),
+        ("softrobot.curved_tube.arc_2d", "implicit_euler_step"),
+        ("softrobot.straight_tube.v4", "_python_implicit_euler_step"),
+    ),
+)
+def test_smoke_calls_corresponding_production_implicit_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, module_name: str, function_name: str,
+) -> None:
+    module = importlib.import_module(module_name)
+
+    def production_probe(*args, **kwargs):
+        raise RuntimeError("production-step-probe")
+
+    monkeypatch.setattr(module, function_name, production_probe)
+    with pytest.raises(RuntimeError, match="production-step-probe"):
+        module.main(["--smoke-test", "--output-dir", str(tmp_path)])
+
+
+def test_tube_smoke_artifacts_require_measured_contact_and_motion(tmp_path: Path) -> None:
+    from softrobot.cli import main
+
+    for model_id in TUBE_MODEL_IDS:
+        output = tmp_path / model_id
+        assert main(["run", model_id, "--smoke-test", "--output-dir", str(output)]) == 0
+        payload = json.loads((output / "smoke_result.json").read_text(encoding="utf-8"))
+        for variant in payload["variants"]:
+            assert variant["state_delta_norm"] > 0.0
+            assert variant["contact_force_norm"] > 0.0 or variant["contact_count"] > 0
+            if "mesh" in model_id or "mesh" in variant["name"]:
+                assert variant["mesh_obj"]
+                assert variant["mesh_face_count"] > 0
+
+
+def test_shared_surrogate_is_not_present() -> None:
+    from softrobot import _tube_smoke
+
+    assert not hasattr(_tube_smoke, "_python_newton")
+
+@pytest.mark.parametrize(
+    ("runner_module", "probe_module", "function_name"),
+    (
+        ("softrobot.straight_tube.legacy_pi_2d", "softrobot.straight_tube._legacy_pi_2d_source", "compute_PI_wall_force"),
+        ("softrobot.straight_tube.v2", "softrobot.straight_tube._v2_source", "contact_quantities"),
+        ("softrobot.straight_tube.v3", "softrobot.straight_tube.v3", "contact_quantities"),
+        ("softrobot.straight_tube.quasi_static_mesh_3d", "softrobot.straight_tube.quasi_static_mesh_3d", "mesh_contact_quantities"),
+        ("softrobot.curved_tube.legacy_arc_2d", "softrobot.curved_tube._legacy_arc_2d_source", "contact_quantities"),
+        ("softrobot.curved_tube.legacy_arc_3d", "softrobot.curved_tube._legacy_arc_3d_source", "contact_response"),
+        ("softrobot.curved_tube.arc_2d", "softrobot.curved_tube.arc_2d", "contact_quantities"),
+        ("softrobot.straight_tube.v4", "softrobot.straight_tube.v4", "contact_quantities"),
+    ),
+)
+def test_smoke_calls_corresponding_production_contact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runner_module: str,
+    probe_module: str, function_name: str,
+) -> None:
+    runner = importlib.import_module(runner_module)
+    probe = importlib.import_module(probe_module)
+
+    def production_probe(*args, **kwargs):
+        raise RuntimeError("production-contact-probe")
+
+    monkeypatch.setattr(probe, function_name, production_probe)
+    with pytest.raises(RuntimeError, match="production-contact-probe"):
+        runner.main(["--smoke-test", "--output-dir", str(tmp_path)])

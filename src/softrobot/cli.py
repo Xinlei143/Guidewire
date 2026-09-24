@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -115,6 +116,28 @@ def _validate_smoke_result(result_path: Path, model_id: str) -> None:
         raise ValueError("smoke_result.json status is not 'passed'")
     if payload.get("finite") is not True:
         raise ValueError("smoke_result.json finite is not true")
+    variants = payload.get("variants")
+    if variants is not None:
+        if not isinstance(variants, list) or not variants:
+            raise ValueError("smoke_result.json variants must be a non-empty list")
+        for index, variant in enumerate(variants):
+            if not isinstance(variant, dict):
+                raise ValueError(f"smoke_result.json variant {index} must be an object")
+            if variant.get("finite") is not True or variant.get("converged") is not True:
+                raise ValueError(f"smoke_result.json variant {index} is not finite and converged")
+            if not isinstance(variant.get("iterations"), int) or variant["iterations"] < 1:
+                raise ValueError(f"smoke_result.json variant {index} has invalid iterations")
+            for key in ("residual", "state_delta_norm", "contact_force_norm"):
+                value = variant.get(key)
+                if not isinstance(value, (int, float)) or not math.isfinite(value):
+                    raise ValueError(f"smoke_result.json variant {index} has invalid {key}")
+            if variant["state_delta_norm"] <= 0.0:
+                raise ValueError(f"smoke_result.json variant {index} did not move")
+            contact_count = variant.get("contact_count")
+            if not isinstance(contact_count, int) or contact_count < 0:
+                raise ValueError(f"smoke_result.json variant {index} has invalid contact_count")
+            if contact_count == 0 and variant["contact_force_norm"] <= 0.0:
+                raise ValueError(f"smoke_result.json variant {index} did not exercise contact")
 
 
 def _run_all_smokes(output_directory: Path) -> int:
