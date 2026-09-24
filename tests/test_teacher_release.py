@@ -101,6 +101,9 @@ def test_repository_release_contract_documented() -> None:
         "smoke test 不是物理验证", "不提供正弦", "不提供自由插入",
     ):
         assert phrase in readme
+    pyproject = (REPO / "pyproject.toml").read_text(encoding="utf-8")
+    for lower_bound in ("numpy>=", "scipy>=", "torch>=", "matplotlib>=", "Pillow>=", "pytest>="):
+        assert lower_bound in pyproject
     lock = (REPO / "requirements-cpu.lock").read_text(encoding="utf-8")
     for requirement in (
         "numpy==", "scipy==", "torch==", "matplotlib==", "Pillow==",

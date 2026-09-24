@@ -9,15 +9,15 @@ description = "Guidewire simulation models for straight and curved vessels"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "numpy",
-    "scipy",
-    "torch",
-    "matplotlib",
-    "Pillow",
+    "numpy>=1.21",
+    "scipy>=1.8",
+    "torch>=2.0",
+    "matplotlib>=3.5",
+    "Pillow>=9",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest"]
+dev = ["pytest>=7"]
 
 [project.scripts]
 softrobot = "softrobot.cli:main"
