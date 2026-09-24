@@ -8,13 +8,13 @@ import numpy as np
 import pytest
 import torch
 
-import mesh_contact_v4 as mesh
-import rod_soft_contact_PI_dynamic_quasi_static_3d_v4 as v4
+from softrobot.backends import mesh_contact_v4 as mesh
+from softrobot.straight_tube import v4
 
 
 ROOT = Path(__file__).resolve().parents[1]
-OBJ = ROOT / "tube_obj" / "straight_tube_L1p5m_boundaryR50mm_shellR60mm_32sides_axial2.obj"
-CURVED_OBJ = ROOT / "tube_obj" / "arc90_L1p5m_xz_wallR60mm_protectionR50mm_64sides_axial256.obj"
+OBJ = ROOT / "src" / "softrobot" / "resources" / "tube_obj" / "straight_tube_L1p5m_boundaryR50mm_shellR60mm_32sides_axial2.obj"
+CURVED_OBJ = ROOT / "src" / "softrobot" / "resources" / "tube_obj" / "arc90_L1p5m_xz_wallR60mm_protectionR50mm_64sides_axial256.obj"
 
 
 def _write_indexed_obj(path, vertices, faces, flip_faces=()):
@@ -166,7 +166,7 @@ def _assert_inward_to_centerline(geometry, centers):
 
 
 def test_mesh_orientation_handles_rotated_swept_tubes(tmp_path):
-    import mesh_contact_v4 as mesh
+    from softrobot.backends import mesh_contact_v4 as mesh
 
     rotation = np.array(((0.0, 0.0, 1.0), (0.0, 1.0, 0.0), (-1.0, 0.0, 0.0)))
     straight = _write_transformed_existing_protection(tmp_path / "straight.obj", np.eye(3))
@@ -181,7 +181,7 @@ def test_mesh_orientation_handles_rotated_swept_tubes(tmp_path):
 
 
 def test_mesh_orientation_handles_curved_and_s_shaped_tubes(tmp_path):
-    import mesh_contact_v4 as mesh
+    from softrobot.backends import mesh_contact_v4 as mesh
 
     curved = mesh.MeshGeometry.from_obj(CURVED_OBJ, device=torch.device("cpu"))
     curved_vertices, curved_faces, curved_groups = mesh._parse_obj(CURVED_OBJ)
@@ -200,7 +200,7 @@ def test_mesh_orientation_handles_curved_and_s_shaped_tubes(tmp_path):
 
 
 def test_mesh_orientation_recovers_random_face_flips_and_reversals(tmp_path):
-    import mesh_contact_v4 as mesh
+    from softrobot.backends import mesh_contact_v4 as mesh
 
     centers = np.array(((0.0, 0.0, 0.0), (0.4, 0.0, 0.0), (0.8, 0.0, 0.0)))
     vertices, faces, _ = _swept_tube(centers, radius=0.15, sides=12)
@@ -228,7 +228,7 @@ def test_mesh_orientation_recovers_random_face_flips_and_reversals(tmp_path):
 
 
 def test_mesh_orientation_handles_connected_three_outlet_branching_surface(tmp_path):
-    import mesh_contact_v4 as mesh
+    from softrobot.backends import mesh_contact_v4 as mesh
 
     vertices, faces = _branching_three_boundary_surface()
     geometry = mesh.MeshGeometry.from_obj(_write_indexed_obj(tmp_path / "branching.obj", vertices, faces))
@@ -269,7 +269,7 @@ def test_mesh_orientation_rejects_unreliable_boundary_caps():
 
 
 def test_mesh_orientation_orients_disconnected_components_independently(tmp_path):
-    import mesh_contact_v4 as mesh
+    from softrobot.backends import mesh_contact_v4 as mesh
 
     first_vertices, first_faces, _ = _swept_tube(((0.0, 0.0, 0.0), (1.0, 0.0, 0.0)), radius=0.2, sides=12)
     second_vertices, second_faces, _ = _swept_tube(((0.0, 3.0, 0.0), (1.0, 3.0, 0.0)), radius=0.2, sides=12)
@@ -285,7 +285,7 @@ def test_mesh_orientation_orients_disconnected_components_independently(tmp_path
 
 
 def test_mesh_orientation_rejects_nonmanifold_protection_surface(tmp_path):
-    import mesh_contact_v4 as mesh
+    from softrobot.backends import mesh_contact_v4 as mesh
 
     vertices = np.array(((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0),
                          (0.0, 0.0, 1.0), (1.0, 1.0, 1.0)))
@@ -296,7 +296,7 @@ def test_mesh_orientation_rejects_nonmanifold_protection_surface(tmp_path):
 
 
 def test_mesh_orientation_rejects_boundary_that_cannot_form_a_loop(tmp_path):
-    import mesh_contact_v4 as mesh
+    from softrobot.backends import mesh_contact_v4 as mesh
 
     vertices = np.array(((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0),
                          (0.0, 0.0, 1.0), (1.0, 1.0, 0.0)))
@@ -311,7 +311,7 @@ def test_mesh_orientation_rejects_boundary_that_cannot_form_a_loop(tmp_path):
 
 
 def test_mesh_geometry_accepts_ascii_and_binary_stl(tmp_path):
-    import mesh_contact_v4 as mesh
+    from softrobot.backends import mesh_contact_v4 as mesh
 
     vertices, faces, centers = _swept_tube(((0.0, 0.0, 0.0), (1.0, 0.0, 0.0)), radius=0.2, sides=12)
     obj_geometry = mesh.MeshGeometry.from_obj(_write_indexed_obj(tmp_path / "tube.obj", vertices, faces))
@@ -324,7 +324,7 @@ def test_mesh_geometry_accepts_ascii_and_binary_stl(tmp_path):
 
 
 def test_mesh_geometry_rejects_malformed_stl(tmp_path):
-    import mesh_contact_v4 as mesh
+    from softrobot.backends import mesh_contact_v4 as mesh
 
     path = tmp_path / "malformed.stl"
     path.write_bytes(b"solid broken\n facet normal 0 0 1\n")
@@ -367,7 +367,7 @@ def _python_contact_for_geometry(geometry, positions):
 
 
 def _cpp_contact_for_geometry(geometry, positions):
-    import der_cpp_backend as backend
+    from softrobot.backends import der_cpp_backend as backend
 
     nodes = len(positions)
     core = backend.DERCore(
@@ -560,7 +560,7 @@ def test_initial_cpp_mesh_clearance_uses_cpp_bvh(monkeypatch):
 
 
 def test_mesh_visualization_proxy_is_low_resolution_and_follows_imported_curve():
-    import mesh_contact_v4 as mesh
+    from softrobot.backends import mesh_contact_v4 as mesh
 
     geometry = mesh.MeshGeometry.from_obj(CURVED_OBJ, device=torch.device("cpu"))
     args = type("Args", (), dict(
@@ -599,10 +599,10 @@ def test_tube_visualization_surface_keeps_analytic_cylinder_fallback():
 
 def test_mesh_module_import_is_independent_of_v3():
     env = os.environ.copy()
-    env["PYTHONPATH"] = str(ROOT)
+    env["PYTHONPATH"] = os.pathsep.join((str(ROOT / "src"), str(ROOT)))
     code = (
-        "import sys; import mesh_contact_v4; "
-        "assert 'rod_soft_contact_PI_dynamic_quasi_static_3d_v3' not in sys.modules"
+        "import sys; from softrobot.backends import mesh_contact_v4; "
+        "assert 'softrobot.straight_tube.v3' not in sys.modules"
     )
     result = subprocess.run(
         [sys.executable, "-c", code], cwd=ROOT, env=env,
@@ -612,7 +612,7 @@ def test_mesh_module_import_is_independent_of_v3():
 
 
 def test_obj_loader_and_nearest_face_return_inward_contact_geometry():
-    import mesh_contact_v4 as mesh
+    from softrobot.backends import mesh_contact_v4 as mesh
 
     geometry = mesh.MeshGeometry.from_obj(
         OBJ, protection_keyword="protection", device=torch.device("cpu"),
@@ -651,7 +651,7 @@ def test_v4_parser_exposes_mesh_contact_without_changing_tube_default(monkeypatc
 
 
 def test_mesh_contact_force_and_jacobian_match_fixed_face_reference():
-    import mesh_contact_v4 as mesh
+    from softrobot.backends import mesh_contact_v4 as mesh
 
     geometry = mesh.MeshGeometry.from_obj(
         OBJ, protection_keyword="protection", device=torch.device("cpu"),
@@ -734,7 +734,7 @@ def test_python_mesh_accepted_state_uses_newton_frozen_topology(monkeypatch):
 
 
 def test_cpp_mesh_contact_kernel_accepts_external_geometry():
-    import der_cpp_backend as backend
+    from softrobot.backends import der_cpp_backend as backend
 
     nodes = 4
     core = backend.DERCore(
@@ -751,7 +751,7 @@ def test_cpp_mesh_contact_kernel_accepts_external_geometry():
     assert actual["jacobian"].shape == (nodes, 3, 3)
     assert actual["force"][1, 1] < 0.0
     assert actual["triangle_ids"].tolist() == [17] * nodes
-    import mesh_contact_v4 as mesh
+    from softrobot.backends import mesh_contact_v4 as mesh
     details = mesh.MeshContactDetails(
         triangle_local=torch.zeros(nodes, dtype=torch.long),
         triangle_obj=torch.full((nodes,), 17, dtype=torch.long),

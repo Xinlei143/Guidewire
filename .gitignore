@@ -1,5 +1,5 @@
-__pycache__/
-*.pyc
+**/__pycache__/
+*.py[cod]
 *.npz
 
 .vscode/browse.vc.db*
@@ -8,6 +8,18 @@ __pycache__/
 .vscode/*.db-wal
 
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+build/
+dist/
+*.egg-info/
+output/
+outputs/
+media/
+wire_report/
+血管导丝/
+third_party/
 
 # LaTeX build artifacts
 *.aux

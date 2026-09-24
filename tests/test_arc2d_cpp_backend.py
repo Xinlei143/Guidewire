@@ -5,8 +5,8 @@ import numpy as np
 import pytest
 import torch
 
-import der_cpp_backend as backend
-import rod_soft_contact_PI_dynamic_quasi_static_2d_arc as arc
+from softrobot.backends import der_cpp_backend as backend
+from softrobot.curved_tube import arc_2d as arc
 
 
 def _args(**overrides):

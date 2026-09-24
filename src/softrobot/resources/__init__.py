@@ -1,0 +1,1 @@
+"""Bundled vessel geometry resources."""

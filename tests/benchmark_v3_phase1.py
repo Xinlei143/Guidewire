@@ -10,7 +10,7 @@ import types
 
 import torch
 
-import rod_soft_contact_PI_dynamic_quasi_static_3d_v3 as rod
+from softrobot.straight_tube import v3 as rod
 
 
 def timed(function, device: torch.device, repeats: int) -> float:

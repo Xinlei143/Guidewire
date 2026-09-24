@@ -6,14 +6,14 @@ import numpy as np
 import pytest
 import torch
 
-from centerline_3d import Centerline3D
-import mesh_contact_v4 as mesh
-import rod_soft_contact_PI_dynamic_quasi_static_3d_v4 as v4
+from softrobot.common.centerline_3d import Centerline3D
+from softrobot.backends import mesh_contact_v4 as mesh
+from softrobot.straight_tube import v4
 
 
 ROOT = Path(__file__).resolve().parents[1]
-OBJ = ROOT / "tube_obj" / "arc90_L1p5m_xz_wallR60mm_protectionR50mm_64sides_axial256.obj"
-CENTERLINE = ROOT / "tube_obj" / "arc90_L1p5m_xz_centerline_800.csv"
+OBJ = ROOT / "src" / "softrobot" / "resources" / "tube_obj" / "arc90_L1p5m_xz_wallR60mm_protectionR50mm_64sides_axial256.obj"
+CENTERLINE = ROOT / "src" / "softrobot" / "resources" / "tube_obj" / "arc90_L1p5m_xz_centerline_800.csv"
 GENERATOR = ROOT / "tools" / "generate_arc_vessel_3d.py"
 RADIUS = 0.9549298123336835
 

@@ -6,10 +6,14 @@ import math
 import unittest
 
 import numpy as np
+import pytest
 import torch
 import torch.nn.functional as F
 
-import rod_soft_contact_PI_dynamic_quasi_static as rod
+rod = pytest.importorskip(
+    "rod_soft_contact_PI_dynamic_quasi_static",
+    reason="legacy pre-v3 solver is not part of the ff5e87b release surface",
+)
 
 
 class LocalDenseJacobianTests(unittest.TestCase):

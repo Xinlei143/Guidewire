@@ -17,9 +17,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import rod_soft_contact_PI_dynamic_quasi_static_3d_v4 as v4
-from der_cpp_backend import DERCore
+from softrobot.straight_tube import v4
+from softrobot.backends.der_cpp_backend import DERCore
 
 
 def _case_state(case: str, nodes: int, length: float) -> dict[str, np.ndarray]:

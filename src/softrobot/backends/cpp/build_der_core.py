@@ -8,8 +8,7 @@ import sys
 from pathlib import Path
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from der_cpp_backend import DERCore
+from softrobot.backends.der_cpp_backend import DERCore
 
 
 def main() -> None:
